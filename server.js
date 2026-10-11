@@ -10,12 +10,14 @@ const PORT = process.env.PORT || 3000;
 const APP_ID = process.env.DERIV_APP_ID || '1089';
 const RR = 2;
 const SCAN_INTERVAL = 300000;
+const FRACTAL_PERIOD = 2;
+const ICHIMOKU = { tenkan: 9, kijun: 26, spanB: 52, displacement: 26 };
+const MAX_CANDLES = 1500;
 
 const WS_URL =
   `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(APP_ID)}`;
 
 const MARKETS = [
-  // Forex — 30 pairs
   { key: 'EUR/USD', aliases: ['EUR/USD', 'EURUSD'] },
   { key: 'GBP/USD', aliases: ['GBP/USD', 'GBPUSD'] },
   { key: 'USD/JPY', aliases: ['USD/JPY', 'USDJPY'] },
@@ -46,14 +48,7 @@ const MARKETS = [
   { key: 'CAD/JPY', aliases: ['CAD/JPY', 'CADJPY'] },
   { key: 'CHF/JPY', aliases: ['CHF/JPY', 'CHFJPY'] },
   { key: 'NZD/CAD', aliases: ['NZD/CAD', 'NZDCAD'] },
-
-  // Gold
-  {
-    key: 'XAU/USD',
-    aliases: ['XAU/USD', 'XAUUSD', 'GOLD/USD', 'GOLD']
-  },
-
-  // US stock indices
+  { key: 'XAU/USD', aliases: ['XAU/USD', 'XAUUSD', 'GOLD/USD', 'GOLD'] },
   { key: 'US 100', aliases: ['US 100', 'US100', 'NASDAQ 100', 'NASDAQ'] },
   { key: 'US 500', aliases: ['US 500', 'US500', 'S&P 500', 'SP500'] },
   { key: 'US 30', aliases: ['US 30', 'US30', 'DOW JONES', 'DOW'] }
@@ -75,8 +70,8 @@ for (const m of MARKETS) {
   state.results[m.key] = {
     market: m.key,
     signal: 'WAIT',
-    status: 'Waiting for connection',
-    reason: 'Waiting for market data'
+    status: 'Starting',
+    reason: 'Waiting for Deriv connection'
   };
 }
 
@@ -86,29 +81,43 @@ let reconnectTimer;
 let scanTimer;
 let pingTimer;
 let scanning = false;
+let reconnectAttempts = 0;
+
 const pending = new Map();
 const lastAlerts = new Map();
 
-function norm(s) {
-  return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+function log(...args) {
+  console.log(new Date().toISOString(), ...args);
+}
+
+function norm(value) {
+  return String(value || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .replace(/^FRX/, '');
 }
 
 function send(payload) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+
   socket.send(JSON.stringify(payload));
   return true;
 }
 
-function request(payload, timeout = 25000) {
+function request(payload, timeout = 30000) {
   return new Promise((resolve, reject) => {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return reject(new Error('Deriv is not connected'));
+      reject(new Error('Deriv WebSocket is not connected'));
+      return;
     }
 
     const id = reqId++;
+
     const timer = setTimeout(() => {
       pending.delete(id);
-      reject(new Error('Deriv request timed out'));
+      reject(new Error(`Request timed out: ${payload.ticks_history || 'Deriv API'}`));
     }, timeout);
 
     pending.set(id, { resolve, reject, timer });
@@ -116,7 +125,7 @@ function request(payload, timeout = 25000) {
     if (!send({ ...payload, req_id: id })) {
       clearTimeout(timer);
       pending.delete(id);
-      reject(new Error('Could not send request'));
+      reject(new Error('Failed to send Deriv request'));
     }
   });
 }
@@ -135,9 +144,12 @@ function resolveSymbols(items) {
     });
 
     if (found) {
-      resolved[market.key] = found.symbol || found.underlying_symbol;
+      resolved[market.key] =
+        found.symbol || found.underlying_symbol;
+
+      log('SYMBOL FOUND:', market.key, '=>', resolved[market.key]);
     } else {
-      console.log('Symbol unavailable:', market.key);
+      log('SYMBOL UNAVAILABLE:', market.key);
     }
   }
 
@@ -145,24 +157,26 @@ function resolveSymbols(items) {
 
   for (const market of MARKETS) {
     const symbol = resolved[market.key];
+
     state.results[market.key] = {
       ...state.results[market.key],
       symbol: symbol || null,
       status: symbol ? 'Ready' : 'Symbol unavailable',
       reason: symbol
         ? 'Waiting for a confirmed setup'
-        : 'Not matched in Deriv active symbols'
+        : 'No matching symbol found in Deriv active symbols'
     };
   }
 
-  console.log(`Resolved ${Object.keys(resolved).length}/${MARKETS.length} markets`);
+  log(`Resolved ${Object.keys(resolved).length}/${MARKETS.length} markets`);
 }
 
+/* Convert Deriv candles into a consistent format. */
 function parseCandles(response) {
-  const candles = response.candles ||
+  const source = response.candles ||
     response.history?.candles || [];
 
-  return candles.map(c => ({
+  return source.map(c => ({
     time: Number(c.epoch ?? c.open_time),
     open: Number(c.open),
     high: Number(c.high),
@@ -177,19 +191,20 @@ function parseCandles(response) {
   ).sort((a, b) => a.time - b.time);
 }
 
-async function getCandles(symbol, granularity, count) {
-  const result = await request({
+async function getCandles(symbol, granularity, count = 220) {
+  const response = await request({
     ticks_history: symbol,
     adjust_start_time: 1,
     count,
     end: 'latest',
     granularity,
     style: 'candles'
-  }, 30000);
+  });
 
-  return parseCandles(result);
+  return parseCandles(response);
 }
 
+/* Build 12-hour candles from hourly candles. */
 function aggregate(candles, seconds) {
   const groups = new Map();
 
@@ -215,119 +230,253 @@ function aggregate(candles, seconds) {
   return [...groups.values()].sort((a, b) => a.time - b.time);
 }
 
-function range(candles, i, n) {
-  if (i < n - 1) return null;
-  const slice = candles.slice(i - n + 1, i + 1);
+function midpoint(candles, index, period) {
+  if (index < period - 1) return null;
+
+  let high = -Infinity;
+  let low = Infinity;
+
+  for (let i = index - period + 1; i <= index; i++) {
+    high = Math.max(high, candles[i].high);
+    low = Math.min(low, candles[i].low);
+  }
+
+  return (high + low) / 2;
+}
+
+/*
+ * Standard Ichimoku:
+ * Tenkan = 9-period midpoint
+ * Kijun = 26-period midpoint
+ * Senkou A = midpoint of Tenkan and Kijun
+ * Senkou B = 52-period midpoint
+ *
+ * The cloud is plotted 26 candles forward. Therefore, the cloud
+ * visible at the current candle is calculated from index - 26.
+ *
+ * Uses the last CLOSED candle, not the currently forming candle.
+ */
+function ichimokuDirection(candles) {
+  const i = candles.length - 2;
+  const { tenkan, kijun, spanB, displacement } = ICHIMOKU;
+
+  if (i < spanB - 1 + displacement) {
+    return {
+      direction: 'WAIT',
+      reason: 'Not enough candles for displaced Ichimoku Cloud'
+    };
+  }
+
+  const tenkanNow = midpoint(candles, i, tenkan);
+  const kijunNow = midpoint(candles, i, kijun);
+
+  const cloudSourceIndex = i - displacement;
+  const tenkanSource = midpoint(candles, cloudSourceIndex, tenkan);
+  const kijunSource = midpoint(candles, cloudSourceIndex, kijun);
+  const spanA = (tenkanSource + kijunSource) / 2;
+  const spanBValue = midpoint(candles, cloudSourceIndex, spanB);
+
+  if (
+    [tenkanNow, kijunNow, spanA, spanBValue].some(
+      value => value === null || !Number.isFinite(value)
+    )
+  ) {
+    return { direction: 'WAIT', reason: 'Ichimoku values unavailable' };
+  }
+
+  const cloudTop = Math.max(spanA, spanBValue);
+  const cloudBottom = Math.min(spanA, spanBValue);
+  const close = candles[i].close;
+
+  if (close > cloudTop && tenkanNow > kijunNow && spanA > spanBValue) {
+    return {
+      direction: 'BUY',
+      reason: 'Close above cloud; Tenkan above Kijun; bullish cloud',
+      close,
+      tenkan: tenkanNow,
+      kijun: kijunNow,
+      cloudTop,
+      cloudBottom
+    };
+  }
+
+  if (close < cloudBottom && tenkanNow < kijunNow && spanA < spanBValue) {
+    return {
+      direction: 'SELL',
+      reason: 'Close below cloud; Tenkan below Kijun; bearish cloud',
+      close,
+      tenkan: tenkanNow,
+      kijun: kijunNow,
+      cloudTop,
+      cloudBottom
+    };
+  }
+
   return {
-    high: Math.max(...slice.map(c => c.high)),
-    low: Math.min(...slice.map(c => c.low))
+    direction: 'WAIT',
+    reason: 'Price or Ichimoku lines do not fully confirm direction',
+    close,
+    tenkan: tenkanNow,
+    kijun: kijunNow,
+    cloudTop,
+    cloudBottom
   };
 }
 
-function direction(candles, tenkanN, kijunN, spanN) {
-  const i = candles.length - 2;
-  if (i < spanN - 1) return 'WAIT';
-
-  const a = range(candles, i, tenkanN);
-  const b = range(candles, i, kijunN);
-  const c = range(candles, i, spanN);
-  if (!a || !b || !c) return 'WAIT';
-
-  const tenkan = (a.high + a.low) / 2;
-  const kijun = (b.high + b.low) / 2;
-  const spanA = (tenkan + kijun) / 2;
-  const spanB = (c.high + c.low) / 2;
-  const top = Math.max(spanA, spanB);
-  const bottom = Math.min(spanA, spanB);
-  const close = candles[i].close;
-
-  if (close > top && tenkan > kijun) return 'BUY';
-  if (close < bottom && tenkan < kijun) return 'SELL';
-  return 'WAIT';
-}
-
-function fractals(candles, period = 2) {
+/* Williams Fractals. A pivot is only returned once right-side candles
+   have formed, so an unconfirmed fractal is never used. */
+function fractals(candles, lastClosedIndex, period = FRACTAL_PERIOD) {
   const highs = [];
   const lows = [];
 
-  for (let i = period; i < candles.length - period; i++) {
-    let high = true;
-    let low = true;
+  for (
+    let i = period;
+    i <= lastClosedIndex - period;
+    i++
+  ) {
+    let isHigh = true;
+    let isLow = true;
 
     for (let j = 1; j <= period; j++) {
       if (
-        candles[i].high <= candles[i-j].high ||
-        candles[i].high <= candles[i+j].high
-      ) high = false;
+        candles[i].high <= candles[i - j].high ||
+        candles[i].high <= candles[i + j].high
+      ) {
+        isHigh = false;
+      }
 
       if (
-        candles[i].low >= candles[i-j].low ||
-        candles[i].low >= candles[i+j].low
-      ) low = false;
+        candles[i].low >= candles[i - j].low ||
+        candles[i].low >= candles[i + j].low
+      ) {
+        isLow = false;
+      }
     }
 
-    if (high) highs.push({ index: i, price: candles[i].high });
-    if (low) lows.push({ index: i, price: candles[i].low });
+    if (isHigh) {
+      highs.push({ index: i, price: candles[i].high });
+    }
+
+    if (isLow) {
+      lows.push({ index: i, price: candles[i].low });
+    }
   }
 
   return { highs, lows };
 }
 
-function trendLine(a, b, i) {
+function trendLine(a, b, index) {
   if (!a || !b || a.index === b.index) return null;
+
   return a.price +
-    ((b.price - a.price) / (b.index - a.index)) * (i - a.index);
+    ((b.price - a.price) / (b.index - a.index)) *
+    (index - a.index);
 }
 
-function checkBreak(candles) {
-  if (candles.length < 10) {
-    return { direction: 'WAIT', reason: 'Not enough 15M candles' };
+/*
+ * Looks for a confirmed 15M line break followed by a LATER retest.
+ * The latest closed 15M candle must be the retest candle.
+ */
+function checkBreakRetest(candles) {
+  const last = candles.length - 2;
+
+  if (last < 20) {
+    return {
+      direction: 'WAIT',
+      reason: 'Not enough closed 15M candles'
+    };
   }
 
-  const { highs, lows } = fractals(candles);
-  const i = candles.length - 2;
-  const prev = candles[i - 1];
-  const last = candles[i];
+  const { highs, lows } = fractals(candles, last);
+  const earliestBreak = Math.max(10, last - 12);
 
-  const hs = highs.filter(x => x.index < i).slice(-2);
-  const ls = lows.filter(x => x.index < i).slice(-2);
+  function searchLine(pivots, side) {
+    if (pivots.length < 2) return null;
 
-  if (hs.length === 2) {
-    const before = trendLine(hs[0], hs[1], i - 1);
-    const now = trendLine(hs[0], hs[1], i);
+    // Try recent pivot pairs first.
+    for (let bIndex = pivots.length - 1; bIndex >= 1; bIndex--) {
+      for (let aIndex = bIndex - 1; aIndex >= 0; aIndex--) {
+        const a = pivots[aIndex];
+        const b = pivots[bIndex];
 
-    if (before !== null && now !== null &&
-        prev.close >= before && last.close < now) {
-      return {
-        direction: 'SELL',
-        level: now,
-        reason: '15M candle closed below fractal trend line'
-      };
+        // Require a descending line for sell or ascending line for buy.
+        if (side === 'SELL' && b.price >= a.price) continue;
+        if (side === 'BUY' && b.price <= a.price) continue;
+
+        let breakIndex = -1;
+
+        for (let j = Math.max(earliestBreak, b.index + 1); j <= last - 1; j++) {
+          const previousLine = trendLine(a, b, j - 1);
+          const currentLine = trendLine(a, b, j);
+
+          if (previousLine === null || currentLine === null) continue;
+
+          if (side === 'SELL') {
+            if (
+              candles[j - 1].close >= previousLine &&
+              candles[j].close < currentLine
+            ) {
+              breakIndex = j;
+            }
+          } else {
+            if (
+              candles[j - 1].close <= previousLine &&
+              candles[j].close > currentLine
+            ) {
+              breakIndex = j;
+            }
+          }
+        }
+
+        if (breakIndex < 0 || breakIndex >= last) continue;
+
+        const level = trendLine(a, b, last);
+        const latest = candles[last];
+
+        if (side === 'SELL') {
+          if (latest.high >= level && latest.close < level) {
+            return {
+              direction: 'SELL',
+              level,
+              breakIndex,
+              reason: '15M close below fractal line, followed by bearish retest'
+            };
+          }
+        } else {
+          if (latest.low <= level && latest.close > level) {
+            return {
+              direction: 'BUY',
+              level,
+              breakIndex,
+              reason: '15M close above fractal line, followed by bullish retest'
+            };
+          }
+        }
+      }
     }
+
+    return null;
   }
 
-  if (ls.length === 2) {
-    const before = trendLine(ls[0], ls[1], i - 1);
-    const now = trendLine(ls[0], ls[1], i);
+  const sell = searchLine(highs, 'SELL');
+  if (sell) return sell;
 
-    if (before !== null && now !== null &&
-        prev.close <= before && last.close > now) {
-      return {
-        direction: 'BUY',
-        level: now,
-        reason: '15M candle closed above fractal trend line'
-      };
-    }
-  }
+  const buy = searchLine(lows, 'BUY');
+  if (buy) return buy;
 
-  return { direction: 'WAIT', reason: 'No confirmed 15M break' };
+  return {
+    direction: 'WAIT',
+    reason: 'Waiting for a confirmed 15M break and subsequent retest'
+  };
 }
 
 function confirm5M(candles, side) {
-  if (candles.length < 4) return false;
+  const lastIndex = candles.length - 2;
 
-  const last = candles[candles.length - 2];
-  const prev = candles[candles.length - 3];
+  if (lastIndex < 2) return false;
+
+  const last = candles[lastIndex];
+  const prev = candles[lastIndex - 1];
 
   if (side === 'BUY') {
     return last.close > last.open && last.close > prev.high;
@@ -340,10 +489,41 @@ function confirm5M(candles, side) {
   return false;
 }
 
+function calculateTrade(candles, side) {
+  const lastIndex = candles.length - 2;
+  const entry = candles[lastIndex].close;
+  const recent = candles.slice(Math.max(0, lastIndex - 14), lastIndex);
+
+  if (recent.length < 5) return null;
+
+  const low = Math.min(...recent.map(c => c.low));
+  const high = Math.max(...recent.map(c => c.high));
+  const buffer = Math.max(Math.abs(entry) * 0.0002, (high - low) * 0.1);
+
+  let sl;
+  let tp;
+
+  if (side === 'BUY') {
+    sl = low - buffer;
+    if (sl >= entry) return null;
+    tp = entry + (entry - sl) * RR;
+  } else {
+    sl = high + buffer;
+    if (sl <= entry) return null;
+    tp = entry - (sl - entry) * RR;
+  }
+
+  return { entry, sl, tp };
+}
+
 async function telegram(message) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) return;
+
+  if (!token || !chatId) {
+    log('Telegram skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing');
+    return;
+  }
 
   try {
     const response = await fetch(
@@ -356,9 +536,14 @@ async function telegram(message) {
     );
 
     const result = await response.json();
-    if (!result.ok) console.error('Telegram error:', result.description);
-  } catch (e) {
-    console.error('Telegram error:', e.message);
+
+    if (!result.ok) {
+      log('Telegram API error:', result.description);
+    } else {
+      log('Telegram alert sent');
+    }
+  } catch (error) {
+    log('Telegram error:', error.message);
   }
 }
 
@@ -370,31 +555,36 @@ async function scanMarket(market) {
       market: market.key,
       signal: 'WAIT',
       status: 'Symbol unavailable',
-      reason: 'No matching Deriv symbol'
+      reason: 'No matching symbol found in Deriv'
     };
   }
 
   try {
     const [h1, m15, m5] = await Promise.all([
-      getCandles(symbol, 3600, 1500),
+      getCandles(symbol, 3600, MAX_CANDLES),
       getCandles(symbol, 900, 220),
       getCandles(symbol, 300, 220)
     ]);
 
-    if (h1.length < 150 || m15.length < 10 || m5.length < 10) {
+    if (h1.length < 100 || m15.length < 25 || m5.length < 20) {
       return {
         market: market.key,
         symbol,
         signal: 'WAIT',
-        status: 'WAIT',
-        reason: 'Insufficient candle history'
+        status: 'Insufficient data',
+        reason: `Candle history too short: H1=${h1.length}, M15=${m15.length}, M5=${m5.length}`
       };
     }
 
     const h12 = aggregate(h1, 43200);
-    const d12 = direction(h12, 20, 60, 120);
-    const d1 = direction(h1, 8, 24, 48);
-    const br = checkBreak(m15);
+
+    // Do not include a potentially incomplete latest 12H candle.
+    const d12Result = ichimokuDirection(h12);
+    const d1Result = ichimokuDirection(h1);
+    const d12 = d12Result.direction;
+    const d1 = d1Result.direction;
+
+    const setup = checkBreakRetest(m15);
 
     let signal = 'WAIT';
     let entry = null;
@@ -403,41 +593,24 @@ async function scanMarket(market) {
     let reason = 'Waiting for timeframe confirmation';
 
     if (d12 === 'WAIT') {
-      reason = '12H direction not confirmed';
-    } else if (d1 !== d12) {
-      reason = '1H direction does not match 12H';
-    } else if (br.direction !== d12) {
-      reason = 'Waiting for matching 15M fractal break';
+      reason = `12H Ichimoku: ${d12Result.reason}`;
+    } else if (d1 === 'WAIT') {
+      reason = `1H Ichimoku: ${d1Result.reason}`;
+    } else if (d12 !== d1) {
+      reason = '1H Ichimoku direction does not match 12H';
+    } else if (setup.direction !== d12) {
+      reason = setup.reason;
+    } else if (!confirm5M(m5, d12)) {
+      reason = '15M retest found; waiting for 5M confirmation';
     } else {
-      const c15 = m15[m15.length - 2];
-      const c5 = m5[m5.length - 2];
-      const level = br.level;
+      const trade = calculateTrade(m5, d12);
 
-      const retest = d12 === 'BUY'
-        ? c15.low <= level && c15.close > level
-        : c15.high >= level && c15.close < level;
-
-      if (!retest) {
-        reason = 'Waiting for 15M retest';
-      } else if (!confirm5M(m5, d12)) {
-        reason = 'Waiting for 5M confirmation';
+      if (!trade) {
+        reason = 'Unable to calculate a valid swing-based stop-loss';
       } else {
-        entry = c5.close;
-        const recent = m5.slice(-16, -2);
-        const lo = Math.min(...recent.map(c => c.low));
-        const hi = Math.max(...recent.map(c => c.high));
-        const buffer = Math.max(Math.abs(entry) * 0.0002, (hi - lo) * 0.1);
-
-        if (d12 === 'BUY') {
-          sl = lo - buffer;
-          tp = entry + (entry - sl) * RR;
-        } else {
-          sl = hi + buffer;
-          tp = entry - (sl - entry) * RR;
-        }
-
+        ({ entry, sl, tp } = trade);
         signal = d12;
-        reason = '12H + 1H + 15M break/retest + 5M confirmed';
+        reason = '12H + 1H Ichimoku, 15M fractal break/retest, 5M confirmation';
       }
     }
 
@@ -448,7 +621,7 @@ async function scanMarket(market) {
       status: signal,
       direction12H: d12,
       direction1H: d1,
-      direction15M: br.direction,
+      direction15M: setup.direction,
       entry,
       sl,
       tp,
@@ -457,56 +630,77 @@ async function scanMarket(market) {
     };
 
     if (signal === 'BUY' || signal === 'SELL') {
-      const alertKey = `${market.key}:${signal}`;
-      const previous = lastAlerts.get(alertKey) || 0;
+      const key = `${market.key}:${signal}`;
+      const previousAlert = lastAlerts.get(key) || 0;
 
-      if (Date.now() - previous > 1800000) {
+      if (Date.now() - previousAlert > 1800000) {
         await telegram(
           `DERIV ${signal} SIGNAL\n` +
           `Market: ${market.key}\n` +
           `Symbol: ${symbol}\n` +
           `Entry: ${entry}\nSL: ${sl}\nTP: ${tp}\n` +
           `Risk/Reward: 1:${RR}\n` +
-          `12H: ${d12} | 1H: ${d1} | 15M: ${br.direction}\n` +
-          `${reason}\nSignal only — no automatic trade executed.`
+          `12H Ichimoku: ${d12}\n` +
+          `1H Ichimoku: ${d1}\n` +
+          `15M Fractal: ${setup.direction}\n` +
+          `${reason}\n` +
+          'Signal only — no automatic trade executed.'
         );
-        lastAlerts.set(alertKey, Date.now());
+
+        lastAlerts.set(key, Date.now());
       }
     }
 
     return result;
-  } catch (e) {
-    console.error(`Scan error ${market.key}:`, e.message);
+  } catch (error) {
+    log(`SCAN ERROR ${market.key}:`, error.message);
+
     return {
       market: market.key,
       symbol,
       signal: 'WAIT',
       status: 'ERROR',
-      reason: e.message
+      reason: error.message
     };
   }
 }
 
 async function runScan() {
-  if (scanning || !state.connected) return;
+  if (scanning || !state.connected) {
+    if (!state.connected) log('Scan skipped: Deriv disconnected');
+    return;
+  }
 
   scanning = true;
   state.scanning = true;
+  log('========== SCAN START ==========');
+
+  let completed = 0;
 
   try {
     for (const market of MARKETS) {
       if (!state.connected) break;
 
       state.results[market.key] = await scanMarket(market);
+      completed++;
 
-      // Space out markets to reduce request bursts.
-      await new Promise(resolve => setTimeout(resolve, 500));
+      const result = state.results[market.key];
+
+      log(
+        `${market.key}: ${result.signal || 'WAIT'} | ` +
+        `${result.reason || result.status}`
+      );
+
+      // Pause between markets to reduce request bursts.
+      await new Promise(resolve => setTimeout(resolve, 700));
     }
 
     state.lastScan = new Date().toISOString();
-  } catch (e) {
-    state.lastError = e.message;
-    console.error('Scan error:', e.message);
+    state.lastError = null;
+    log(`========== SCAN FINISHED: ${completed}/${MARKETS.length} ==========`);
+  } catch (error) {
+    state.lastError = error.message;
+    log('SCAN FAILED:', error.message);
   } finally {
     scanning = false;
     state.scanning = false;
@@ -519,38 +713,59 @@ function connect() {
   if (pingTimer) clearInterval(pingTimer);
 
   if (socket) {
-    try { socket.terminate(); } catch (_) {}
+    try {
+      socket.terminate();
+    } catch (_) {}
   }
 
-  console.log('Connecting to Deriv:', WS_URL);
+  reconnectAttempts++;
+  log(`Connecting to Deriv (attempt ${reconnectAttempts}): ${WS_URL}`);
+
   socket = new WebSocket(WS_URL, { handshakeTimeout: 20000 });
 
   socket.on('open', async () => {
     state.connected = true;
     state.lastError = null;
-    console.log('Connected to Deriv');
+    reconnectAttempts = 0;
 
-    pingTimer = setInterval(() => send({ ping: 1 }), 45000);
+    log('SUCCESS: Connected to Deriv WebSocket');
+
+    pingTimer = setInterval(() => {
+      send({ ping: 1 });
+    }, 45000);
 
     try {
-      const result = await request({
+      const response = await request({
         active_symbols: 'brief',
         product_type: 'basic'
       });
 
-      resolveSymbols(result.active_symbols || []);
+      if (response.active_symbols) {
+        resolveSymbols(response.active_symbols);
+      } else {
+        throw new Error('Deriv returned no active_symbols list');
+      }
 
-      if (!scanTimer) scanTimer = setInterval(runScan, SCAN_INTERVAL);
-      runScan();
-    } catch (e) {
-      state.lastError = e.message;
-      console.error('Symbol discovery failed:', e.message);
+      if (!scanTimer) {
+        scanTimer = setInterval(runScan, SCAN_INTERVAL);
+      }
+
+      await runScan();
+    } catch (error) {
+      state.lastError = error.message;
+      log('STARTUP / SYMBOL DISCOVERY ERROR:', error.message);
     }
   });
 
   socket.on('message', raw => {
     let data;
-    try { data = JSON.parse(raw.toString()); } catch (_) { return; }
+
+    try {
+      data = JSON.parse(raw.toString());
+    } catch (_) {
+      log('Ignored invalid WebSocket JSON');
+      return;
+    }
 
     if (data.req_id && pending.has(data.req_id)) {
       const item = pending.get(data.req_id);
@@ -558,31 +773,35 @@ function connect() {
       pending.delete(data.req_id);
 
       if (data.error) {
-        item.reject(new Error(data.error.message || 'Deriv API error'));
+        item.reject(new Error(
+          `${data.error.code || 'DerivError'}: ${data.error.message || 'API error'}`
+        ));
       } else {
         item.resolve(data);
       }
+
       return;
     }
 
     if (data.error) {
       state.lastError = data.error.message;
-      console.error('Deriv error:', state.lastError);
+      log('DERIV API ERROR:', data.error.message);
     }
   });
 
-  socket.on('error', e => {
-    state.lastError = e.message;
-    console.error('WebSocket error:', e.message);
+  socket.on('error', error => {
+    state.lastError = error.message;
+    log('WEBSOCKET ERROR:', error.message);
   });
 
   socket.on('close', (code, reason) => {
     state.connected = false;
+
     if (pingTimer) clearInterval(pingTimer);
     pingTimer = null;
 
-    state.lastError = `WebSocket closed: ${code} ${reason || ''}`;
-    console.error(state.lastError);
+    state.lastError = `WebSocket closed: ${code} ${reason.toString()}`;
+    log(state.lastError);
 
     for (const [id, item] of pending) {
       clearTimeout(item.timer);
@@ -642,8 +861,18 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Configured markets: ${MARKETS.length}`);
+app.listen(PORT, '0.0.0.0', () => {
+  log(`SERVER STARTED on port ${PORT}`);
+  log(`Configured markets: ${MARKETS.length}`);
+  log('Strategy: 12H Ichimoku -> 1H Ichimoku -> 15M fractal break/retest -> 5M confirmation');
+  log('Mode: SIGNAL ONLY; no automatic trades');
   connect();
+});
+
+process.on('unhandledRejection', error => {
+  log('UNHANDLED REJECTION:', error?.message || error);
+});
+
+process.on('uncaughtException', error => {
+  log('UNCAUGHT EXCEPTION:', error.message);
 });
