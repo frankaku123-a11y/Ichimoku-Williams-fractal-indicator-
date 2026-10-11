@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Deriv Ichimoku + Williams Fractals Scanner</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1220;--panel:#121c2d;--line:#27364d;--muted:#9caec4;--text:#edf4ff;--green:#35d39a;--red:#ff6f7d;--yellow:#f4c86a;--blue:#7bb5ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{padding:22px 18px;border-bottom:1px solid var(--line);background:#0e1727}
+main{max-width:1400px;margin:auto;padding:18px}
+h1{font-size:22px;margin:0 0 6px}
+p{margin:0;color:var(--muted)}
+.top{display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+.stats{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin:18px 0}
+.stat,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+.stat small{display:block;color:var(--muted)}
+.stat strong{font-size:21px}
+.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button{background:#2866c5;color:white;border:0;border-radius:8px;padding:10px 14px;font-weight:650;cursor:pointer}
+button:disabled{opacity:.5}
+input,select{background:#0b1423;border:1px solid var(--line);border-radius:8px;color:var(--text);padding:9px}
+.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:12px}
+table{width:100%;border-collapse:collapse;min-width:1050px;background:var(--panel)}
+th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em;background:#101a2b;position:sticky;top:0}
+tr:last-child td{border-bottom:0}
+.signal{font-weight:800}
+.BUY{color:var(--green)}
+.SELL{color:var(--red)}
+.WAIT{color:var(--yellow)}
+.pill{display:inline-block;border:1px solid var(--line);border-radius:20px;padding:3px 8px;color:var(--muted);font-size:12px}
+.good{color:var(--green)}
+.bad{color:var(--red)}
+.warn{color:var(--yellow)}
+.notice{margin-top:14px;color:var(--muted);font-size:12px}
+.error{color:var(--red);margin-top:8px;overflow-wrap:anywhere}
+.footer{color:var(--muted);font-size:12px;margin:16px 0}
+@media(max-width:700px){
+.stats{grid-template-columns:repeat(2,minmax(120px,1fr))}
+h1{font-size:18px}
+main{padding:12px}
+}
+</style>
+</head>
+<body>
+<header>
+<div class="top">
+<div>
+<h1>Ichimoku + Williams Fractals</h1>
+<p>Deriv market scanner · 23 requested markets · Signal-only</p>
+</div>
+<div class="actions">
+<span id="connection" class="pill">Connecting to Deriv…</span>
+<button id="scanBtn">Scan now</button>
+</div>
+</div>
+</header>
+
+<main>
+<div class="stats">
+<div class="stat"><small>Markets requested</small><strong id="requested">23</strong></div>
+<div class="stat"><small>Symbols matched</small><strong id="matched">—</strong></div>
+<div class="stat"><small>Last completed scan</small><strong id="lastScan" style="font-size:14px">—</strong></div>
+<div class="stat"><small>Signals</small><strong id="signalCount">0</strong></div>
+</div>
+
+<div class="panel" style="margin-bottom:14px">
+<div class="top">
+<div>
+<strong>Scanner results</strong>
+<p style="margin-top:4px">12H Ichimoku → 1H structure → 15M fractal break/retest → 5M confirmation</p>
+</div>
+<div class="actions">
+<input id="search" placeholder="Filter market…">
+<select id="filter">
+<option value="ALL">All statuses</option>
+<option value="BUY">BUY only</option>
+<option value="SELL">SELL only</option>
+<option value="WAIT">WAIT only</option>
+<option value="MISSING">Missing symbols</option>
+</select>
+</div>
+</div>
+</div>
+
+<div class="tablewrap">
+<table>
+<thead>
+<tr>
+<th>Market</th>
+<th>Deriv symbol</th>
+<th>Price</th>
+<th>12H Ichimoku</th>
+<th>1H Ichimoku</th>
+<th>1H structure</th>
+<th>15M fractal</th>
+<th>Signal</th>
+<th>Entry</th>
+<th>Stop loss</th>
+<th>Take profit</th>
+<th>Details</th>
+</tr>
+</thead>
+<tbody id="rows">
+<tr><td colspan="12">Waiting for first scan…</td></tr>
+</tbody>
+</table>
+</div>
+
+<div id="error" class="error"></div>
+
+<div class="notice">
+A missing symbol means Deriv did not return a close-enough match from active_symbols; verify the exact symbol before relying on that market. No orders are placed. Signals are experimental and require demo testing.
+</div>
+
+<div class="footer">
+Ichimoku calculations use the selected custom lengths (12H 20/60/120, 1H 8/24/48). The cloud is evaluated from current calculated spans for signal filtering; this may not reproduce every plotting detail of TradingView's displaced cloud.
+</div>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+let current=[];
+
+function fmt(v){
+return v==null?'—':String(v);
+}
+
+function cls(v){
+return ['BUY','SELL','WAIT'].includes(v)?v:'';
+}
+
+function render(){
+const q=$('search').value.toLowerCase();
+const f=$('filter').value;
+
+let rows=current.filter(r=>
+String(r.market).toLowerCase().includes(q)||
+String(r.symbol||'').toLowerCase().includes(q)
+);
+
+rows=rows.filter(r=>
+f==='ALL'||
+(f==='MISSING'?!r.symbol:
+f==='WAIT'?r.signal==='WAIT':
+r.signal===f)
+);
+
+$('rows').innerHTML=rows.map(r=>`
+<tr>
+<td><strong>${r.market}</strong><br><span class="pill">${r.type||''}</span></td>
+<td>${r.symbol||'—'}${r.resolvedName?`<br><small>${r.resolvedName}</small>`:''}</td>
+<td>${fmt(r.price)}</td>
+<td>${fmt(r.ichimoku12H)}</td>
+<td>${fmt(r.ichimoku1H)}</td>
+<td>${fmt(r.structure1H)}</td>
+<td>${fmt(r.fractalReason)}</td>
+<td class="signal ${cls(r.signal)}">${fmt(r.signal)}</td>
+<td>${fmt(r.entry)}</td>
+<td>${fmt(r.stopLoss)}</td>
+<td>${fmt(r.takeProfit)}</td>
+<td title="${String(r.reason||'').replace(/"/g,'&quot;')}">${fmt(r.status)}<br><small>${fmt(r.reason)}</small></td>
+</tr>`).join('')||'<tr><td colspan="12">No matching markets</td></tr>';
+}
+
+async function refresh(){
+try{
+const r=await fetch('/api/status');
+const d=await r.json();
+
+current=d.results||[];
+
+$('connection').textContent=d.connected?'Deriv connected':'Disconnected';
+$('connection').className='pill '+(d.connected?'good':'bad');
+$('requested').textContent=d.marketCount??23;
+$('matched').textContent=d.symbolsResolved??0;
+$('lastScan').textContent=d.lastScan?new Date(d.lastScan).toLocaleTimeString():'Waiting';
+$('signalCount').textContent=current.filter(x=>x.signal==='BUY'||x.signal==='SELL').length;
+$('error').textContent=d.lastError||'';
+
+render();
+}catch(e){
+$('connection').textContent='Dashboard API error';
+$('error').textContent=e.message;
+}
+}
+
+$('scanBtn').onclick=async()=>{
+const b=$('scanBtn');
+b.disabled=true;
+
+try{
+const r=await fetch('/api/scan',{method:'POST'});
+const d=await r.json();
+
+if(!r.ok)alert(d.error||'Could not start scan');
+}finally{
+setTimeout(()=>b.disabled=false,1500);
+}
+};
+
+$('search').addEventListener('input',render);
+$('filter').addEventListener('change',render);
+
+refresh();
+setInterval(refresh,4000);
+</script>
+</body>
+</html>
