@@ -9,9 +9,10 @@ const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089'; // Set your own Deriv a
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const SCAN_INTERVAL_MS = Math.max(60000, Number(process.env.SCAN_INTERVAL_MS || 60000));
+const RECONNECT_DELAY_MS = 5000;
 const RISK_REWARD = Math.max(1, Number(process.env.RISK_REWARD || 2));
 const FRACTAL_N = 2;
-const WS_URL = `wss://frontend.binaryws.com/websockets/v3?app_id=${encodeURIComponent(DERIV_APP_ID)}`;
+const WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(DERIV_APP_ID)}`;
 
 // The first 10 are the pairs from the previous bot. The next 9 forex pairs,
 // gold, and three US indices make 23 requested markets in total.
@@ -61,6 +62,7 @@ let reconnectTimer;
 let scanTimer;
 let scanRunning = false;
 let activeSymbols = [];
+let keepAliveTimer = null;
 const pending = new Map();
 const candleCache = new Map();
 const lastAlertByMarket = new Map();
@@ -89,11 +91,17 @@ function derivRequest(payload, timeoutMs = 25000) {
 }
 function connectDeriv() {
   clearTimeout(reconnectTimer);
+  if (keepAliveTimer) clearInterval(keepAliveTimer);
   try { if (socket) socket.terminate(); } catch (_) {}
-  socket = new WebSocket(WS_URL);
+  console.log(`Connecting to Deriv WebSocket: ${WS_URL.replace(/app_id=[^&]+/, 'app_id=REDACTED')}`);
+  socket = new WebSocket(WS_URL, { handshakeTimeout: 20000 });
   socket.on('open', async () => {
     state.connected = true;
     state.lastError = null;
+    console.log('Deriv WebSocket connected.');
+    keepAliveTimer = setInterval(() => {
+      if (socket && socket.readyState === WebSocket.OPEN) safeSend({ ping: 1 });
+    }, 45000);
     try {
       const response = await derivRequest({ active_symbols: 'brief', product_type: 'basic' });
       activeSymbols = response.active_symbols || [];
@@ -103,6 +111,8 @@ function connectDeriv() {
     } catch (err) {
       state.lastError = err.message;
       state.connected = false;
+      console.error('Deriv initial request failed:', err.message);
+      try { socket.close(); } catch (_) {}
     }
   });
   socket.on('message', raw => {
@@ -117,15 +127,20 @@ function connectDeriv() {
     }
     if (data.error && !item) state.lastError = data.error.message || 'Deriv API error';
   });
-  socket.on('close', () => {
+  socket.on('close', (code, reason) => {
     state.connected = false;
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+    const reasonText = reason ? reason.toString() : '(no reason supplied)';
+    state.lastError = `WebSocket closed (${code}): ${reasonText}`;
+    console.error(state.lastError);
     for (const [id, p] of pending) { clearTimeout(p.timer); p.reject(new Error('Deriv connection closed')); pending.delete(id); }
-    reconnectTimer = setTimeout(connectDeriv, 5000);
+    reconnectTimer = setTimeout(connectDeriv, RECONNECT_DELAY_MS);
   });
   socket.on('error', err => {
-  state.lastError = err.message;
-  console.error('Deriv WebSocket error:', err.message);
-});
+    state.lastError = `Deriv WebSocket error: ${err.message}`;
+    console.error(state.lastError);
+  });
 }
 
 function resolveSymbols() {
@@ -283,7 +298,9 @@ async function scanMarket(market) {
   const now = Date.now();
   // Load H1 once per hour; it is also aggregated into UTC-aligned 12H candles.
   if (!cache.h1.length || now - (cache.fetchedAt.h1 || 0) > 55 * 60 * 1000) {
-    cache.h1 = await fetchCandles(market.symbol, 3600, 1500);
+    // 5,000 H1 candles provide enough history to build 120 completed 12H Ichimoku bars.
+    // If Deriv returns less history for a symbol, the 12H calculation stays NOT READY.
+    cache.h1 = await fetchCandles(market.symbol, 3600, 5000);
     cache.fetchedAt.h1 = now;
     await sleep(180);
   }
@@ -299,7 +316,7 @@ async function scanMarket(market) {
   candleCache.set(cacheKey, cache);
 
   const h12 = aggregateCandles(cache.h1, 43200);
-  const ichi12 = ichimoku(h12, { conversion: 20, base: 60, spanB: 120 });
+  const ichi12 = h12.length >= 122 ? ichimoku(h12, { conversion: 20, base: 60, spanB: 120 }) : null;
   const ichi1 = ichimoku(cache.h1, { conversion: 8, base: 24, spanB: 48 });
   const structure = get1HStructure(cache.h1);
   const fractal = assessFractalBreak(cache.m15);
