@@ -991,4 +991,67 @@ async function refresh(){
       ' | Last scan: '+(d.lastScan||'not yet')+
       ' | Last error: '+(d.lastError||'none');
 
-    document.getElementById('markets').innerHTML
+    document.getElementById('markets').innerHTML=d.markets.map(m=>
+      '<tr><td>'+esc(m.market)+'</td><td>'+esc(m.status)+'</td>'+
+      '<td>'+esc(m.direction12H)+'</td><td>'+esc(m.direction1H)+'</td>'+
+      '<td>'+esc(m.fractal15M)+'</td><td>'+esc(m.retest15M)+'</td>'+
+      '<td>'+esc(m.confirm5M)+'</td><td>'+esc(price(m.entry))+'</td>'+
+      '<td>'+esc(price(m.stopLoss))+'</td><td>'+esc(price(m.takeProfit))+'</td>'+
+      '<td>'+esc(m.error||'')+'</td></tr>'
+    ).join('');
+
+    document.getElementById('signals').innerHTML=d.signals.length
+      ? d.signals.map(s=>
+        '<div class="status"><b>'+esc(s.market)+' '+esc(s.direction)+'</b><br>'+
+        'Entry: '+esc(price(s.entry))+' | SL: '+esc(price(s.stopLoss))+
+        ' | TP: '+esc(price(s.takeProfit))+' | '+esc(s.createdAt)+'</div>'
+      ).join('')
+      : '<div class="muted">No confirmed signals yet.</div>';
+
+    document.getElementById('logs').textContent=(d.logs||[]).join('\\n');
+  }catch(e){
+    document.getElementById('status').textContent='Dashboard error: '+e.message;
+  }
+}
+
+function esc(v){
+  return String(v==null?'':v).replace(/[&<>"']/g,c=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+function price(v){
+  if(v==null)return '—';
+  return Number(v).toPrecision(8).replace(/0+$/,'').replace(/\\.$/,'');
+}
+
+async function scanNow(){
+  try{
+    const r=await fetch('/api/scan',{method:'POST'});
+    const d=await r.json();
+    if(!r.ok)alert(d.error||'Scan request failed');
+    refresh();
+  }catch(e){alert(e.message)}
+}
+
+refresh();
+setInterval(refresh,5000);
+</script>
+</body>
+</html>`);
+});
+
+app.listen(PORT, () => {
+  log(`HTTP server listening on port ${PORT}`);
+  log(`Markets configured: ${MARKETS.length}`);
+  log('Signal-only mode enabled; no trades will be placed.');
+  connect();
+});
+
+process.on('uncaughtException', error => {
+  log('UNCAUGHT EXCEPTION:', error.stack || error.message);
+});
+
+process.on('unhandledRejection', error => {
+  log('UNHANDLED REJECTION:', error && (error.stack || error.message || error));
+});
