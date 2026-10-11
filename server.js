@@ -1,3 +1,4 @@
+
 'use strict';
 
 const express = require('express');
@@ -7,48 +8,56 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const APP_ID = process.env.DERIV_APP_ID || '1089';
 const RR = 2;
-const SCAN_INTERVAL = 5 * 60 * 1000;
-const REQUEST_TIMEOUT = 20000;
-const RECONNECT_DELAY = 15000;
+const SCAN_INTERVAL = 300000;
+const TIMEOUT = 20000;
 
-// Keep the original Deriv endpoints and alternate on reconnect.
 const WS_URLS = [
-  `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(APP_ID)}`,
-  `wss://ws.binaryws.com/websockets/v3?app_id=${encodeURIComponent(APP_ID)}`
+  'wss://ws.binaryws.com/websockets/v3',
+  'wss://ws.derivws.com/websockets/v3'
 ];
 
 const MARKETS = [
-  'EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF', 'USD/CAD',
-  'AUD/USD', 'NZD/USD', 'EUR/GBP', 'EUR/JPY', 'GBP/JPY',
-  'AUD/JPY', 'CAD/JPY', 'CHF/JPY', 'NZD/JPY', 'EUR/AUD',
-  'EUR/CAD', 'EUR/CHF', 'EUR/NZD', 'GBP/AUD', 'GBP/CAD',
-  'GBP/CHF', 'GBP/NZD', 'AUD/CAD', 'AUD/CHF', 'AUD/NZD',
-  'CAD/CHF', 'NZD/CAD', 'NZD/CHF', 'XAU/USD', 'XAG/USD',
+  'EUR/USD', 'GBP/USD', 'USD/JPY',
+  'USD/CHF', 'USD/CAD', 'AUD/USD',
+  'NZD/USD', 'EUR/GBP', 'EUR/JPY',
+  'GBP/JPY', 'AUD/JPY', 'CAD/JPY',
+  'CHF/JPY', 'NZD/JPY', 'EUR/AUD',
+  'EUR/CAD', 'EUR/CHF', 'EUR/NZD',
+  'GBP/AUD', 'GBP/CAD', 'GBP/CHF',
+  'GBP/NZD', 'AUD/CAD', 'AUD/CHF',
+  'AUD/NZD', 'CAD/CHF', 'NZD/CAD',
+  'NZD/CHF', 'XAU/USD', 'XAG/USD',
   'US 100', 'US 500', 'US 30'
 ];
 
 const state = {
   connected: false,
   connecting: false,
-  startedAt: new Date().toISOString(),
-  lastScan: null,
-  lastError: null,
-  connectionAttempts: 0,
-  endpoint: null,
   activeSymbolsLoaded: false,
   scanning: false,
-  messages: [],
+  attempts: 0,
+  lastError: null,
+  lastScan: null,
+  lastPriceAt: null,
+  endpoint: null,
   markets: {},
   signals: [],
-  counts: { checked: 0, signals: 0, errors: 0 }
+  logs: [],
+  counts: {
+    checked: 0,
+    signals: 0,
+    errors: 0
+  }
 };
 
 for (const market of MARKETS) {
   state.markets[market] = {
     market,
-    status: 'Waiting for connection',
+    symbol: null,
+    price: null,
+    priceAt: null,
+    status: 'Waiting',
     direction12H: '—',
     direction1H: '—',
     fractal15M: '—',
@@ -57,32 +66,42 @@ for (const market of MARKETS) {
     entry: null,
     stopLoss: null,
     takeProfit: null,
-    updatedAt: null,
     error: null
   };
 }
 
-let socket = null;
+let ws = null;
 let endpointIndex = 0;
-let nextRequestId = 1;
+let generation = 0;
+let requestId = 1;
+let heartbeat = null;
 let reconnectTimer = null;
 let scanTimer = null;
 let scanAgain = false;
 let activeSymbols = [];
-let lastTelegramAt = {};
 
 const pending = new Map();
 const breakoutMemory = new Map();
+const subscriptions = new Set();
+const telegramCooldown = new Map();
 
-function log(...args) {
-  const line = `[${new Date().toISOString()}] ${args.join(' ')}`;
+function log(...items) {
+  const line =
+    `[${new Date().toISOString()}] ` +
+    items.map(String).join(' ');
+
   console.log(line);
-  state.messages.push(line);
-  if (state.messages.length > 150) state.messages.shift();
+  state.logs.push(line);
+
+  if (state.logs.length > 150) {
+    state.logs.shift();
+  }
 }
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(resolve =>
+    setTimeout(resolve, ms)
+  );
 }
 
 function normalize(value) {
@@ -91,285 +110,357 @@ function normalize(value) {
     .replace(/[^A-Z0-9]/g, '');
 }
 
-function marketKey(market) {
-  return normalize(market);
+function updateMarket(market, values) {
+  Object.assign(state.markets[market], values);
 }
 
-function setMarket(market, values) {
-  if (!state.markets[market]) return;
-  Object.assign(state.markets[market], values, {
-    updatedAt: new Date().toISOString()
-  });
-}
-
-function clearPending(reason) {
-  for (const [id, item] of pending.entries()) {
+function rejectPending(reason) {
+  for (const [id, item] of pending) {
     clearTimeout(item.timer);
-    item.reject(new Error(reason));
     pending.delete(id);
+    item.reject(new Error(reason));
   }
 }
 
-function scheduleReconnect() {
+function request(payload, gen = generation) {
+  return new Promise((resolve, reject) => {
+    if (
+      !ws ||
+      ws.readyState !== WebSocket.OPEN ||
+      gen !== generation
+    ) {
+      return reject(
+        new Error('Deriv WebSocket not connected')
+      );
+    }
+
+    const id = requestId++;
+    const currentSocket = ws;
+
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error('Deriv request timeout'));
+    }, TIMEOUT);
+
+    pending.set(id, {
+      resolve,
+      reject,
+      timer
+    });
+
+    currentSocket.send(
+      JSON.stringify({
+        ...payload,
+        req_id: id
+      }),
+      error => {
+        if (error && pending.has(id)) {
+          clearTimeout(timer);
+          pending.delete(id);
+          reject(error);
+        }
+      }
+    );
+  });
+}
+
+function reconnect() {
   if (reconnectTimer) return;
 
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connect();
-  }, RECONNECT_DELAY);
+  }, 15000);
 }
 
 function connect() {
-  if (state.connecting) return;
-
-  if (socket && (
-    socket.readyState === WebSocket.OPEN ||
-    socket.readyState === WebSocket.CONNECTING
-  )) {
-    return;
-  }
+  if (
+    state.connecting ||
+    (ws && (
+      ws.readyState === WebSocket.OPEN ||
+      ws.readyState === WebSocket.CONNECTING
+    ))
+  ) return;
 
   state.connecting = true;
-  state.connectionAttempts++;
+  state.attempts++;
 
-  const endpoint = WS_URLS[endpointIndex % WS_URLS.length];
-  state.endpoint = endpoint;
+  const url =
+    WS_URLS[endpointIndex % WS_URLS.length];
 
-  log(
-    `Connecting to Deriv (attempt ${state.connectionAttempts}):`,
-    endpoint
-  );
+  state.endpoint = url;
 
-  let newSocket;
+  log('Connecting to Deriv:', url);
+
+  let socket;
 
   try {
-    newSocket = new WebSocket(endpoint, {
-      handshakeTimeout: REQUEST_TIMEOUT,
+    socket = new WebSocket(url, {
+      handshakeTimeout: TIMEOUT,
       perMessageDeflate: false
     });
-    socket = newSocket;
   } catch (error) {
     state.connecting = false;
     state.lastError = error.message;
-    log('WEBSOCKET CREATE ERROR:', error.message);
-    endpointIndex = (endpointIndex + 1) % WS_URLS.length;
-    scheduleReconnect();
+    endpointIndex++;
+    reconnect();
     return;
   }
 
-  newSocket.on('open', () => {
-    if (socket !== newSocket) return;
+  ws = socket;
+  const gen = ++generation;
+
+  socket.on('open', () => {
+    if (ws !== socket) return;
 
     state.connected = true;
     state.connecting = false;
     state.lastError = null;
 
-    log('WEBSOCKET CONNECTED successfully.');
+    log('DERIV WEBSOCKET CONNECTED');
 
-    loadActiveSymbols().catch(error => {
+    heartbeat = setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          ping: 1
+        }));
+      }
+    }, 30000);
+
+    initializeMarkets(gen).catch(error => {
+      if (gen !== generation) return;
+
       state.lastError = error.message;
-      log('ACTIVE SYMBOLS ERROR:', error.message);
+      log('INITIALIZATION ERROR:', error.message);
+
+      socket.close();
     });
   });
 
-  newSocket.on('message', raw => {
-    if (socket !== newSocket) return;
+  socket.on('message', raw => {
+    if (ws !== socket) return;
 
     let data;
 
     try {
       data = JSON.parse(raw.toString());
     } catch {
-      log('Could not parse WebSocket message.');
       return;
     }
 
     if (data.error) {
+      state.lastError =
+        data.error.message || 'Deriv API error';
+
       log(
-        'DERIV API ERROR:',
+        'DERIV ERROR:',
         data.error.code || '',
-        data.error.message || ''
+        state.lastError
       );
+    }
+
+    if (data.msg_type === 'tick' && data.tick) {
+      const symbol =
+        data.tick.symbol || data.echo_req?.ticks;
+
+      const price = Number(data.tick.quote);
+
+      if (Number.isFinite(price)) {
+        const time = new Date(
+          Number(data.tick.epoch) * 1000
+        ).toISOString();
+
+        state.lastPriceAt = time;
+
+        for (const market of MARKETS) {
+          if (state.markets[market].symbol === symbol) {
+            updateMarket(market, {
+              price,
+              priceAt: time
+            });
+          }
+        }
+      }
     }
 
     if (data.req_id && pending.has(data.req_id)) {
       const item = pending.get(data.req_id);
+
       clearTimeout(item.timer);
       pending.delete(data.req_id);
 
       if (data.error) {
-        item.reject(new Error(
-          `${data.error.code || 'API_ERROR'}: ${data.error.message || 'Request failed'}`
-        ));
+        item.reject(
+          new Error(data.error.message)
+        );
       } else {
         item.resolve(data);
       }
     }
   });
 
-  newSocket.on('error', error => {
-    if (socket !== newSocket) return;
+  socket.on('error', error => {
+    if (ws !== socket) return;
 
     state.lastError = error.message;
     log('WEBSOCKET ERROR:', error.message);
   });
 
-  newSocket.on('close', (code, reason) => {
-    if (socket !== newSocket) return;
+  socket.on('close', (code, reason) => {
+    if (ws !== socket) return;
 
     state.connected = false;
     state.connecting = false;
     state.activeSymbolsLoaded = false;
 
+    clearInterval(heartbeat);
+    clearTimeout(scanTimer);
+
+    heartbeat = null;
+    scanTimer = null;
+
+    activeSymbols = [];
+    subscriptions.clear();
+
+    rejectPending('WebSocket disconnected');
+
+    ws = null;
+    endpointIndex++;
+
     log(
-      `WebSocket closed: ${code}`,
-      reason ? reason.toString() : ''
+      'WEBSOCKET CLOSED:',
+      code,
+      reason.toString()
     );
 
-    clearPending(`WebSocket closed (${code})`);
-
-    socket = null;
-    endpointIndex = (endpointIndex + 1) % WS_URLS.length;
-
-    if (scanTimer) {
-      clearTimeout(scanTimer);
-      scanTimer = null;
-    }
-
-    scheduleReconnect();
+    reconnect();
   });
 }
 
-function request(payload) {
-  return new Promise((resolve, reject) => {
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      reject(new Error('WebSocket is not connected.'));
-      return;
-    }
-
-    const req_id = nextRequestId++;
-    const message = { ...payload, req_id };
-
-    const timer = setTimeout(() => {
-      pending.delete(req_id);
-      reject(new Error(
-        `Request timed out: ${
-          payload.ticks_history ||
-          payload.active_symbols ||
-          'Deriv request'
-        }`
-      ));
-    }, REQUEST_TIMEOUT);
-
-    pending.set(req_id, { resolve, reject, timer });
-
-    try {
-      socket.send(JSON.stringify(message), error => {
-        if (error) {
-          clearTimeout(timer);
-          pending.delete(req_id);
-          reject(error);
-        }
-      });
-    } catch (error) {
-      clearTimeout(timer);
-      pending.delete(req_id);
-      reject(error);
-    }
-  });
-}
-
-async function loadActiveSymbols() {
-  log('Requesting Deriv active symbols...');
-
-  const response = await request({
-    active_symbols: 'brief',
-    product_type: 'basic'
-  });
-
-  activeSymbols = Array.isArray(response.active_symbols)
-    ? response.active_symbols
-    : [];
-
-  state.activeSymbolsLoaded = activeSymbols.length > 0;
-
-  log(`Active symbols loaded: ${activeSymbols.length}`);
-
-  if (!activeSymbols.length) {
-    throw new Error('Deriv returned no active symbols.');
-  }
-
-  for (const market of MARKETS) {
-    const found = resolveSymbol(market);
-
-    if (found) {
-      log(`SYMBOL FOUND: ${market} -> ${found.symbol || found.underlying_symbol}`);
-      setMarket(market, { error: null });
-    } else {
-      log(`SYMBOL NOT FOUND: ${market}`);
-      setMarket(market, {
-        status: 'Symbol unavailable',
-        error: 'No matching Deriv active symbol'
-      });
-    }
-  }
-
-  if (!scanTimer) runScan();
-}
+const ALIASES = {
+  XAUUSD: ['GOLD', 'XAUUSD'],
+  XAGUSD: ['SILVER', 'XAGUSD'],
+  US100: ['US100', 'NASDAQ100', 'USTECH100'],
+  US500: ['US500', 'SP500', 'USA500'],
+  US30: ['US30', 'DJ30', 'WALLSTREET30']
+};
 
 function resolveSymbol(market) {
   const wanted = normalize(market);
 
-  const aliases = {
-    XAUUSD: ['XAUUSD', 'GOLD'],
-    XAGUSD: ['XAGUSD', 'SILVER'],
-    US100: ['US100', 'NASDAQ100', 'USTECH100'],
-    US500: ['US500', 'SP500', 'USA500'],
-    US30: ['US30', 'DJ30', 'WALLSTREET30']
-  };
-
-  const targets = aliases[wanted] || [wanted];
+  const targets = [
+    wanted,
+    ...(ALIASES[wanted] || [])
+  ].map(normalize);
 
   for (const item of activeSymbols) {
-    const candidates = [
-      item.underlying_symbol,
+    const names = [
       item.symbol,
+      item.underlying_symbol,
       item.display_name,
       item.underlying_symbol_name
     ].map(normalize);
 
-    if (targets.some(target => candidates.includes(target))) {
+    if (targets.some(t => names.includes(t))) {
       return item;
-    }
-  }
-
-  for (const item of activeSymbols) {
-    const combined = normalize([
-      item.underlying_symbol,
-      item.symbol,
-      item.display_name,
-      item.underlying_symbol_name
-    ].join(' '));
-
-    if (targets.some(target => combined.includes(target))) {
-      if (wanted.length >= 6 || combined.includes(wanted)) return item;
     }
   }
 
   return null;
 }
 
-async function getCandles(symbol, granularity, count) {
+function symbolCode(item) {
+  return item?.symbol ||
+    item?.underlying_symbol ||
+    null;
+}
+
+async function initializeMarkets(gen) {
+  log('Loading Deriv market symbols...');
+
+  const response = await request({
+    active_symbols: 'brief'
+  }, gen);
+
+  if (gen !== generation) return;
+
+  activeSymbols = response.active_symbols || [];
+
+  if (!activeSymbols.length) {
+    throw new Error('No active symbols returned');
+  }
+
+  state.activeSymbolsLoaded = true;
+
+  log(
+    'ACTIVE SYMBOLS LOADED:',
+    activeSymbols.length
+  );
+
+  const uniqueSymbols = new Set();
+
+  for (const market of MARKETS) {
+    const found = resolveSymbol(market);
+    const symbol = symbolCode(found);
+
+    updateMarket(market, {
+      symbol,
+      status: symbol ? 'Ready' : 'Unavailable',
+      error: symbol
+        ? null
+        : 'Symbol not found in Deriv API'
+    });
+
+    if (symbol) {
+      uniqueSymbols.add(symbol);
+      log('SYMBOL:', market, '=>', symbol);
+    }
+  }
+
+  for (const symbol of uniqueSymbols) {
+    if (gen !== generation) return;
+
+    try {
+      await request({
+        ticks: symbol,
+        subscribe: 1
+      }, gen);
+
+      subscriptions.add(symbol);
+
+      log('LIVE PRICE SUBSCRIBED:', symbol);
+    } catch (error) {
+      log(
+        'SUBSCRIPTION ERROR:',
+        symbol,
+        error.message
+      );
+    }
+
+    await sleep(100);
+  }
+
+  runScan();
+}
+
+async function getCandles(
+  symbol,
+  granularity,
+  count,
+  gen
+) {
   const response = await request({
     ticks_history: symbol,
     style: 'candles',
     granularity,
     count,
     end: 'latest'
-  });
+  }, gen);
 
   if (!Array.isArray(response.candles)) {
-    throw new Error(`No candles returned for ${symbol}, ${granularity}`);
+    throw new Error(
+      `No candles for ${symbol} / ${granularity}`
+    );
   }
 
   return response.candles
@@ -381,37 +472,42 @@ async function getCandles(symbol, granularity, count) {
       close: Number(c.close)
     }))
     .filter(c =>
-      Number.isFinite(c.time) &&
-      Number.isFinite(c.open) &&
-      Number.isFinite(c.high) &&
-      Number.isFinite(c.low) &&
-      Number.isFinite(c.close)
+      [
+        c.time,
+        c.open,
+        c.high,
+        c.low,
+        c.close
+      ].every(Number.isFinite)
     )
     .sort((a, b) => a.time - b.time);
 }
 
 function completedCandles(candles, seconds) {
   const now = Math.floor(Date.now() / 1000);
-  return candles.filter(c => c.time + seconds <= now);
+
+  return candles.filter(
+    c => c.time + seconds <= now
+  );
 }
 
 function aggregate12H(hourly) {
   const buckets = new Map();
 
   for (const candle of hourly) {
-    const bucketTime = Math.floor(candle.time / 43200) * 43200;
+    const time =
+      Math.floor(candle.time / 43200) * 43200;
 
-    if (!buckets.has(bucketTime)) {
-      buckets.set(bucketTime, {
-        time: bucketTime,
-        open: candle.open,
-        high: candle.high,
-        low: candle.low,
-        close: candle.close,
-        lastTime: candle.time
+    if (!buckets.has(time)) {
+      buckets.set(time, {
+        ...candle,
+        time,
+        lastTime: candle.time,
+        count: 1
       });
     } else {
-      const b = buckets.get(bucketTime);
+      const b = buckets.get(time);
+
       b.high = Math.max(b.high, candle.high);
       b.low = Math.min(b.low, candle.low);
 
@@ -419,52 +515,72 @@ function aggregate12H(hourly) {
         b.close = candle.close;
         b.lastTime = candle.time;
       }
+
+      b.count++;
     }
   }
 
   const now = Math.floor(Date.now() / 1000);
 
   return [...buckets.values()]
-    .filter(c => c.time + 43200 <= now)
-    .sort((a, b) => a.time - b.time)
-    .map(({ time, open, high, low, close }) => ({
-      time, open, high, low, close
-    }));
+    .filter(c =>
+      c.time + 43200 <= now &&
+      c.count === 12
+    )
+    .sort((a, b) => a.time - b.time);
 }
 
 function midpoint(candles, period, index) {
   if (index < period - 1) return null;
 
-  let high = -Infinity;
-  let low = Infinity;
+  const section = candles.slice(
+    index - period + 1,
+    index + 1
+  );
 
-  for (let i = index - period + 1; i <= index; i++) {
-    high = Math.max(high, candles[i].high);
-    low = Math.min(low, candles[i].low);
-  }
+  const high = Math.max(
+    ...section.map(c => c.high)
+  );
+
+  const low = Math.min(
+    ...section.map(c => c.low)
+  );
 
   return (high + low) / 2;
 }
 
 function ichimokuDirection(candles) {
-  if (candles.length < 80) return 'INSUFFICIENT DATA';
-
-  const i = candles.length - 1;
-  const tenkan = midpoint(candles, 9, i);
-  const kijun = midpoint(candles, 26, i);
-  const spanA = (tenkan + kijun) / 2;
-  const spanB = midpoint(candles, 52, i);
-  const close = candles[i].close;
-
-  if ([tenkan, kijun, spanA, spanB].some(v => v === null)) {
+  if (candles.length < 80) {
     return 'INSUFFICIENT DATA';
   }
 
-  const cloudTop = Math.max(spanA, spanB);
-  const cloudBottom = Math.min(spanA, spanB);
+  const i = candles.length - 1;
 
-  if (close > cloudTop && tenkan > kijun) return 'BULLISH';
-  if (close < cloudBottom && tenkan < kijun) return 'BEARISH';
+  const tenkan = midpoint(candles, 9, i);
+  const kijun = midpoint(candles, 26, i);
+
+  const spanA = (tenkan + kijun) / 2;
+  const spanB = midpoint(candles, 52, i);
+
+  const close = candles[i].close;
+
+  if (
+    [tenkan, kijun, spanA, spanB]
+      .some(v => v === null)
+  ) {
+    return 'INSUFFICIENT DATA';
+  }
+
+  const top = Math.max(spanA, spanB);
+  const bottom = Math.min(spanA, spanB);
+
+  if (close > top && tenkan > kijun) {
+    return 'BULLISH';
+  }
+
+  if (close < bottom && tenkan < kijun) {
+    return 'BEARISH';
+  }
 
   return 'NEUTRAL';
 }
@@ -472,7 +588,11 @@ function ichimokuDirection(candles) {
 function findFractals(candles, type) {
   const result = [];
 
-  for (let i = 2; i < candles.length - 2; i++) {
+  for (
+    let i = 2;
+    i < candles.length - 2;
+    i++
+  ) {
     const value = type === 'high'
       ? candles[i].high
       : candles[i].low;
@@ -481,14 +601,15 @@ function findFractals(candles, type) {
     const right = candles.slice(i + 1, i + 3);
 
     const confirmed = type === 'high'
-      ? left.every(c => value > c.high) &&
-        right.every(c => value > c.high)
-      : left.every(c => value < c.low) &&
-        right.every(c => value < c.low);
+      ? [...left, ...right].every(
+          c => value > c.high
+        )
+      : [...left, ...right].every(
+          c => value < c.low
+        );
 
     if (confirmed) {
       result.push({
-        index: i,
         time: candles[i].time,
         value
       });
@@ -498,50 +619,66 @@ function findFractals(candles, type) {
   return result;
 }
 
-function trendLineValue(a, b, time) {
-  if (!a || !b || b.time === a.time) return null;
+function lineValue(a, b, time) {
+  if (!a || !b || a.time === b.time) {
+    return null;
+  }
 
   return a.value +
-    ((b.value - a.value) / (b.time - a.time)) *
+    ((b.value - a.value) /
+      (b.time - a.time)) *
     (time - a.time);
 }
 
-function fractalBreakAndRetest(market, candles) {
+function fractalBreakRetest(market, candles) {
   if (candles.length < 20) {
-    return { status: 'INSUFFICIENT DATA', direction: null };
+    return {
+      status: 'INSUFFICIENT DATA',
+      direction: null
+    };
   }
 
   const highs = findFractals(candles, 'high');
   const lows = findFractals(candles, 'low');
-  const last = candles[candles.length - 1];
-  const prev = candles[candles.length - 2];
 
-  const recentHighs = highs.slice(-2);
-  const recentLows = lows.slice(-2);
-
-  if (recentHighs.length < 2 || recentLows.length < 2) {
-    return { status: 'Waiting for confirmed fractals', direction: null };
+  if (highs.length < 2 || lows.length < 2) {
+    return {
+      status: 'Waiting for fractals',
+      direction: null
+    };
   }
 
-  const resistanceNow = trendLineValue(
-    recentHighs[0], recentHighs[1], last.time
-  );
-  const resistancePrev = trendLineValue(
-    recentHighs[0], recentHighs[1], prev.time
-  );
-  const supportNow = trendLineValue(
-    recentLows[0], recentLows[1], last.time
-  );
-  const supportPrev = trendLineValue(
-    recentLows[0], recentLows[1], prev.time
+  const last = candles.at(-1);
+  const prev = candles.at(-2);
+
+  const resistanceNow = lineValue(
+    highs.at(-2),
+    highs.at(-1),
+    last.time
   );
 
-  const key = marketKey(market);
+  const resistancePrev = lineValue(
+    highs.at(-2),
+    highs.at(-1),
+    prev.time
+  );
+
+  const supportNow = lineValue(
+    lows.at(-2),
+    lows.at(-1),
+    last.time
+  );
+
+  const supportPrev = lineValue(
+    lows.at(-2),
+    lows.at(-1),
+    prev.time
+  );
+
+  const key = normalize(market);
   const remembered = breakoutMemory.get(key);
 
   if (
-    resistanceNow !== null &&
-    resistancePrev !== null &&
     prev.close <= resistancePrev &&
     last.close > resistanceNow
   ) {
@@ -552,14 +689,12 @@ function fractalBreakAndRetest(market, candles) {
     });
 
     return {
-      status: 'BREAKOUT BUY — waiting for retest',
+      status: 'BUY breakout; waiting retest',
       direction: null
     };
   }
 
   if (
-    supportNow !== null &&
-    supportPrev !== null &&
     prev.close >= supportPrev &&
     last.close < supportNow
   ) {
@@ -570,21 +705,21 @@ function fractalBreakAndRetest(market, candles) {
     });
 
     return {
-      status: 'BREAKOUT SELL — waiting for retest',
+      status: 'SELL breakout; waiting retest',
       direction: null
     };
   }
 
   if (!remembered) {
     return {
-      status: 'Waiting for candle close beyond fractal line',
+      status: 'Waiting for breakout',
       direction: null
     };
   }
 
   if (last.time <= remembered.time) {
     return {
-      status: `${remembered.direction} breakout recorded; waiting`,
+      status: 'Waiting for next candle',
       direction: null
     };
   }
@@ -595,9 +730,8 @@ function fractalBreakAndRetest(market, candles) {
   );
 
   const touched =
-    Math.abs(last.low - remembered.line) <= tolerance ||
-    Math.abs(last.high - remembered.line) <= tolerance ||
-    (last.low <= remembered.line && last.high >= remembered.line);
+    last.low <= remembered.line + tolerance &&
+    last.high >= remembered.line - tolerance;
 
   if (
     remembered.direction === 'BUY' &&
@@ -606,8 +740,9 @@ function fractalBreakAndRetest(market, candles) {
     last.close > last.open
   ) {
     breakoutMemory.delete(key);
+
     return {
-      status: 'BUY retest/rejection confirmed',
+      status: 'BUY retest confirmed',
       direction: 'BUY'
     };
   }
@@ -619,14 +754,15 @@ function fractalBreakAndRetest(market, candles) {
     last.close < last.open
   ) {
     breakoutMemory.delete(key);
+
     return {
-      status: 'SELL retest/rejection confirmed',
+      status: 'SELL retest confirmed',
       direction: 'SELL'
     };
   }
 
   return {
-    status: `${remembered.direction} breakout recorded; waiting for retest`,
+    status: 'Waiting for retest',
     direction: null
   };
 }
@@ -634,132 +770,156 @@ function fractalBreakAndRetest(market, candles) {
 function confirm5M(candles, direction) {
   if (candles.length < 3) return false;
 
-  const last = candles[candles.length - 1];
-  const prev = candles[candles.length - 2];
+  const last = candles.at(-1);
+  const prev = candles.at(-2);
 
   if (direction === 'BUY') {
-    return last.close > last.open && last.close > prev.high;
+    return (
+      last.close > last.open &&
+      last.close > prev.high
+    );
   }
 
   if (direction === 'SELL') {
-    return last.close < last.open && last.close < prev.low;
+    return (
+      last.close < last.open &&
+      last.close < prev.low
+    );
   }
 
   return false;
 }
 
-function makeTradeLevels(candles, direction) {
+function tradeLevels(candles, direction) {
   const recent = candles.slice(-12);
+
   if (recent.length < 3) return null;
 
-  const entry = candles[candles.length - 1].close;
-  let stopLoss;
+  const entry = candles.at(-1).close;
 
   if (direction === 'BUY') {
-    stopLoss = Math.min(...recent.map(c => c.low));
-    if (stopLoss >= entry) return null;
+    const stopLoss = Math.min(
+      ...recent.map(c => c.low)
+    );
 
-    const risk = entry - stopLoss;
+    if (stopLoss >= entry) return null;
 
     return {
       entry,
       stopLoss,
-      takeProfit: entry + risk * RR,
-      riskReward: `1:${RR}`
+      takeProfit:
+        entry + (entry - stopLoss) * RR
     };
   }
 
-  stopLoss = Math.max(...recent.map(c => c.high));
-  if (stopLoss <= entry) return null;
+  const stopLoss = Math.max(
+    ...recent.map(c => c.high)
+  );
 
-  const risk = stopLoss - entry;
+  if (stopLoss <= entry) return null;
 
   return {
     entry,
     stopLoss,
-    takeProfit: entry - risk * RR,
-    riskReward: `1:${RR}`
+    takeProfit:
+      entry - (stopLoss - entry) * RR
   };
 }
 
-function formatPrice(value) {
-  if (!Number.isFinite(value)) return '—';
-  return Number(value.toPrecision(8)).toString();
-}
-
-async function sendTelegram(textMessage, market) {
+async function sendTelegram(message, market) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
 
   if (!token || !chatId) return;
 
   const now = Date.now();
+  const previous = telegramCooldown.get(market) || 0;
 
-  if (now - (lastTelegramAt[market] || 0) < 10 * 60 * 1000) {
-    log('Telegram cooldown active for', market);
-    return;
-  }
+  if (now - previous < 600000) return;
 
   try {
     const response = await fetch(
       `https://api.telegram.org/bot${token}/sendMessage`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json'
+        },
         body: JSON.stringify({
           chat_id: chatId,
-          text: textMessage
-        })
+          text: message
+        }),
+        signal: AbortSignal.timeout(15000)
       }
     );
 
     const result = await response.json();
 
     if (!response.ok || !result.ok) {
-      throw new Error(result.description || `HTTP ${response.status}`);
+      throw new Error(
+        result.description || 'Telegram failed'
+      );
     }
 
-    lastTelegramAt[market] = now;
-    log('Telegram alert sent for', market);
+    telegramCooldown.set(market, now);
+    log('TELEGRAM SIGNAL SENT:', market);
+
   } catch (error) {
     log('TELEGRAM ERROR:', error.message);
   }
 }
 
-async function scanMarket(market) {
+async function scanMarket(market, gen) {
   const resolved = resolveSymbol(market);
+  const symbol = symbolCode(resolved);
 
-  if (!resolved) {
-    setMarket(market, {
-      status: 'Symbol unavailable',
-      error: 'No matching Deriv active symbol'
-    });
-    return;
-  }
-
-  const symbol = resolved.underlying_symbol || resolved.symbol;
+  if (!symbol) return;
 
   try {
-    const hourlyRaw = await getCandles(symbol, 3600, 1200);
-    await sleep(250);
+    const hourlyRaw = await getCandles(
+      symbol, 3600, 1800, gen
+    );
 
-    const m15Raw = await getCandles(symbol, 900, 180);
-    await sleep(250);
+    await sleep(150);
 
-    const m5Raw = await getCandles(symbol, 300, 180);
+    const m15Raw = await getCandles(
+      symbol, 900, 180, gen
+    );
 
-    const h1 = completedCandles(hourlyRaw, 3600);
+    await sleep(150);
+
+    const m5Raw = await getCandles(
+      symbol, 300, 180, gen
+    );
+
+    if (gen !== generation) return;
+
+    const h1 = completedCandles(
+      hourlyRaw, 3600
+    );
+
     const h12 = aggregate12H(h1);
-    const m15 = completedCandles(m15Raw, 900);
-    const m5 = completedCandles(m5Raw, 300);
 
-    const direction12H = ichimokuDirection(h12);
-    const direction1H = ichimokuDirection(h1);
-    const fractal = fractalBreakAndRetest(market, m15);
+    const m15 = completedCandles(
+      m15Raw, 900
+    );
+
+    const m5 = completedCandles(
+      m5Raw, 300
+    );
+
+    const direction12H =
+      ichimokuDirection(h12);
+
+    const direction1H =
+      ichimokuDirection(h1);
+
+    const fractal =
+      fractalBreakRetest(market, m15);
 
     state.counts.checked++;
 
-    setMarket(market, {
+    updateMarket(market, {
       status: 'Scanned',
       direction12H,
       direction1H,
@@ -769,86 +929,111 @@ async function scanMarket(market) {
       error: null
     });
 
-    const higherDirection =
-      direction12H === 'BULLISH' && direction1H === 'BULLISH'
-        ? 'BUY'
-        : direction12H === 'BEARISH' && direction1H === 'BEARISH'
-          ? 'SELL'
-          : null;
+    let direction = null;
 
-    if (!higherDirection || fractal.direction !== higherDirection) return;
+    if (
+      direction12H === 'BULLISH' &&
+      direction1H === 'BULLISH'
+    ) {
+      direction = 'BUY';
+    }
 
-    const confirmed = confirm5M(m5, higherDirection);
+    if (
+      direction12H === 'BEARISH' &&
+      direction1H === 'BEARISH'
+    ) {
+      direction = 'SELL';
+    }
 
-    setMarket(market, {
-      confirm5M: confirmed
-        ? `${higherDirection} confirmed`
-        : 'Waiting for 5M confirmation'
-    });
+    if (
+      !direction ||
+      fractal.direction !== direction
+    ) return;
 
-    if (!confirmed) return;
+    if (!confirm5M(m5, direction)) {
+      updateMarket(market, {
+        confirm5M: 'Waiting for confirmation'
+      });
 
-    const levels = makeTradeLevels(m5, higherDirection);
+      return;
+    }
+
+    const levels = tradeLevels(m5, direction);
+
     if (!levels) return;
 
-    const candleTime = m5[m5.length - 1].time;
-    const id = `${marketKey(market)}-${higherDirection}-${candleTime}`;
+    const candleTime = m5.at(-1).time;
 
-    if (state.signals.some(signal => signal.id === id)) return;
+    const id =
+      `${normalize(market)}-${direction}-${candleTime}`;
+
+    if (state.signals.some(s => s.id === id)) {
+      return;
+    }
 
     const signal = {
       id,
       market,
       symbol,
-      direction: higherDirection,
+      direction,
       timeframe: '12H + 1H + 15M + 5M',
-      entry: levels.entry,
-      stopLoss: levels.stopLoss,
-      takeProfit: levels.takeProfit,
-      riskReward: levels.riskReward,
-      candleTime,
+      ...levels,
+      riskReward: '1:2',
       createdAt: new Date().toISOString()
     };
 
     state.signals.unshift(signal);
     state.signals = state.signals.slice(0, 100);
+
     state.counts.signals++;
 
-    setMarket(market, {
+    updateMarket(market, {
       status: 'SIGNAL',
-      entry: levels.entry,
-      stopLoss: levels.stopLoss,
-      takeProfit: levels.takeProfit,
-      confirm5M: `${higherDirection} confirmed`
+      confirm5M: `${direction} confirmed`,
+      ...levels
     });
 
     log(
-      `SIGNAL ${market} ${higherDirection}`,
-      `Entry=${formatPrice(levels.entry)}`,
-      `SL=${formatPrice(levels.stopLoss)}`,
-      `TP=${formatPrice(levels.takeProfit)}`
+      'NEW SIGNAL:',
+      market,
+      direction,
+      'ENTRY:', levels.entry,
+      'SL:', levels.stopLoss,
+      'TP:', levels.takeProfit
     );
 
-    await sendTelegram([
-      `DERIV SIGNAL — ${market}`,
-      `Direction: ${higherDirection}`,
-      `12H Ichimoku: ${direction12H}`,
-      `1H Ichimoku: ${direction1H}`,
-      '15M Williams Fractal: breakout + retest',
-      '5M confirmation: confirmed',
-      `Entry: ${formatPrice(levels.entry)}`,
-      `Stop Loss: ${formatPrice(levels.stopLoss)}`,
-      `Take Profit: ${formatPrice(levels.takeProfit)}`,
-      `Risk/Reward: ${levels.riskReward}`,
-      'Signal only — no trade was placed.'
-    ].join('\n'), market);
+    await sendTelegram(
+      [
+        `DERIV SIGNAL — ${market}`,
+        `Direction: ${direction}`,
+        `12H Ichimoku: ${direction12H}`,
+        `1H Ichimoku: ${direction1H}`,
+        '15M Fractal: Breakout + Retest',
+        '5M: Confirmed',
+        `Entry: ${levels.entry}`,
+        `Stop Loss: ${levels.stopLoss}`,
+        `Take Profit: ${levels.takeProfit}`,
+        'Risk Reward: 1:2',
+        'Signal only — no trade placed'
+      ].join('\n'),
+      market
+    );
+
   } catch (error) {
+    if (gen !== generation) return;
+
     state.counts.errors++;
-    setMarket(market, {
+
+    updateMarket(market, {
       status: 'Scan error',
       error: error.message
     });
-    log(`SCAN ERROR ${market}:`, error.message);
+
+    log(
+      'SCAN ERROR:',
+      market,
+      error.message
+    );
   }
 }
 
@@ -858,34 +1043,49 @@ async function runScan() {
     return;
   }
 
-  if (!state.connected || !state.activeSymbolsLoaded) {
-    log('Scan skipped: Deriv connection or symbols not ready.');
-    return;
-  }
+  if (
+    !state.connected ||
+    !state.activeSymbolsLoaded
+  ) return;
 
   state.scanning = true;
-  log(`========== SCAN START (${MARKETS.length} markets) ==========`);
+  const gen = generation;
+
+  clearTimeout(scanTimer);
+  scanTimer = null;
+
+  log('SCAN START:', MARKETS.length, 'markets');
 
   try {
     for (const market of MARKETS) {
-      if (!state.connected) break;
+      if (
+        !state.connected ||
+        gen !== generation
+      ) break;
 
-      await scanMarket(market);
+      await scanMarket(market, gen);
       await sleep(200);
     }
   } finally {
     state.scanning = false;
     state.lastScan = new Date().toISOString();
-    log('========== SCAN FINISHED ==========');
 
-    if (scanAgain && state.connected) {
+    log('SCAN FINISHED');
+
+    if (
+      state.connected &&
+      state.activeSymbolsLoaded
+    ) {
+      const delay = scanAgain
+        ? 1000
+        : SCAN_INTERVAL;
+
       scanAgain = false;
-      setTimeout(runScan, 1000);
-    } else if (state.connected) {
-      scanTimer = setTimeout(() => {
-        scanTimer = null;
-        runScan();
-      }, SCAN_INTERVAL);
+
+      scanTimer = setTimeout(
+        runScan,
+        delay
+      );
     }
   }
 }
@@ -894,164 +1094,257 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     connected: state.connected,
-    connecting: state.connecting,
-    activeSymbolsLoaded: state.activeSymbolsLoaded,
-    endpoint: state.endpoint,
-    attempts: state.connectionAttempts,
-    lastError: state.lastError
+    activeSymbolsLoaded:
+      state.activeSymbolsLoaded,
+    attempts: state.attempts,
+    lastError: state.lastError,
+    lastPriceAt: state.lastPriceAt
   });
 });
 
 app.get('/api/status', (req, res) => {
   res.json({
-    connected: state.connected,
-    connecting: state.connecting,
-    endpoint: state.endpoint,
-    attempts: state.connectionAttempts,
-    activeSymbolsLoaded: state.activeSymbolsLoaded,
-    scanning: state.scanning,
-    startedAt: state.startedAt,
-    lastScan: state.lastScan,
-    lastError: state.lastError,
-    counts: state.counts,
+    ...state,
     markets: Object.values(state.markets),
     signals: state.signals.slice(0, 50),
-    logs: state.messages.slice(-80)
+    logs: state.logs.slice(-80),
+    subscribedSymbols: subscriptions.size
   });
 });
 
 app.get('/api/symbols', (req, res) => {
   res.json({
-    configured: MARKETS,
     activeSymbolsCount: activeSymbols.length,
-    resolved: MARKETS.map(market => {
-      const found = resolveSymbol(market);
-      return {
-        market,
-        symbol: found
-          ? (found.underlying_symbol || found.symbol)
-          : null
-      };
-    })
+    markets: MARKETS.map(market => ({
+      market,
+      symbol: symbolCode(resolveSymbol(market))
+    }))
   });
 });
 
 app.post('/api/scan', (req, res) => {
-  if (!state.connected || !state.activeSymbolsLoaded) {
+  if (
+    !state.connected ||
+    !state.activeSymbolsLoaded
+  ) {
     return res.status(503).json({
       ok: false,
-      error: 'Deriv is not connected or active symbols are not loaded.'
+      error: 'Deriv not connected'
     });
   }
 
   runScan();
-  return res.json({ ok: true, message: 'Scan requested.' });
+
+  res.json({
+    ok: true,
+    message: 'Scan requested'
+  });
 });
 
 app.get('/', (req, res) => {
-  res.type('html').send(`<!doctype html>
-<html lang="en">
+  res.type('html').send(`
+<!DOCTYPE html>
+<html>
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Deriv Ichimoku + Williams Fractal Scanner</title>
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+<title>Deriv Trading Scanner</title>
 <style>
-body{font-family:Arial,sans-serif;margin:16px;background:#101820;color:#f3f6f9}
-h2{margin-bottom:6px}.muted{color:#aab7c4}
-button{padding:10px 14px;margin:8px 0;background:#147d92;color:white;border:0;border-radius:6px}
-.status{padding:10px;background:#1d2a35;border-radius:8px;margin:10px 0;overflow-wrap:anywhere}
-table{border-collapse:collapse;width:100%;min-width:900px}
-th,td{border:1px solid #334450;padding:8px;text-align:left;font-size:12px}
-th{background:#1d2a35;position:sticky;top:0}
-.wrap{overflow:auto}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1116;padding:10px;border-radius:8px}
+body {
+  background:#101820;
+  color:white;
+  font-family:Arial;
+  margin:15px;
+}
+h2 {color:#35d0e2}
+.status {
+  background:#20303c;
+  padding:12px;
+  border-radius:8px;
+  margin:10px 0;
+}
+button {
+  background:#16899b;
+  color:white;
+  border:0;
+  padding:12px;
+  border-radius:6px;
+}
+.wrap {overflow-x:auto}
+table {
+  border-collapse:collapse;
+  min-width:1100px;
+  width:100%;
+}
+th,td {
+  border:1px solid #40505c;
+  padding:8px;
+  font-size:12px;
+}
+th {background:#243746}
+pre {
+  background:#080e14;
+  padding:12px;
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+}
 </style>
 </head>
 <body>
-<h2>Deriv Ichimoku + Williams Fractal Scanner</h2>
-<div class="muted">Signal-only dashboard · No automatic trades</div>
-<div class="status" id="status">Loading status...</div>
-<button onclick="scanNow()">Scan now</button>
-<h3>Market status</h3>
-<div class="wrap"><table>
-<thead><tr><th>Market</th><th>Status</th><th>12H</th><th>1H</th><th>15M fractal</th><th>Retest</th><th>5M</th><th>Entry</th><th>SL</th><th>TP</th><th>Error</th></tr></thead>
-<tbody id="markets"></tbody></table></div>
-<h3>Recent signals</h3><div id="signals"></div>
-<h3>Latest logs</h3><pre id="logs">Waiting for logs...</pre>
+<h2>Deriv Ichimoku + Williams Fractal</h2>
+<p>Live Market Scanner — Signal Only</p>
+<div id="status" class="status">
+Connecting...
+</div>
+<button onclick="scanNow()">Scan Now</button>
+<h3>Market Analysis</h3>
+<div class="wrap">
+<table>
+<thead>
+<tr>
+<th>Market</th>
+<th>Live Price</th>
+<th>Status</th>
+<th>12H</th>
+<th>1H</th>
+<th>15M Fractal</th>
+<th>Retest</th>
+<th>5M</th>
+<th>Entry</th>
+<th>SL</th>
+<th>TP</th>
+<th>Error</th>
+</tr>
+</thead>
+<tbody id="markets"></tbody>
+</table>
+</div>
+<h3>Recent Signals</h3>
+<div id="signals"></div>
+<h3>Server Logs</h3>
+<pre id="logs"></pre>
+
 <script>
-async function refresh(){
-  try{
-    const r=await fetch('/api/status');
-    const d=await r.json();
+function esc(v) {
+  return String(v == null ? '' : v)
+    .replace(/[&<>"']/g, c => ({
+      '&':'&amp;',
+      '<':'&lt;',
+      '>':'&gt;',
+      '"':'&quot;',
+      "'":'&#39;'
+    }[c]));
+}
+
+function price(v) {
+  return v == null
+    ? '—'
+    : String(Number(Number(v).toPrecision(8)));
+}
+
+async function refresh() {
+  try {
+    const response = await fetch('/api/status');
+    const data = await response.json();
+
     document.getElementById('status').textContent =
-      'Connection: '+(d.connected?'CONNECTED':'DISCONNECTED')+
-      ' | Connecting: '+d.connecting+
-      ' | Active symbols loaded: '+d.activeSymbolsLoaded+
-      ' | Attempts: '+d.attempts+
-      ' | Scanning: '+d.scanning+
-      ' | Last scan: '+(d.lastScan||'not yet')+
-      ' | Last error: '+(d.lastError||'none');
+      'Connection: ' +
+      (data.connected ? 'CONNECTED' : 'DISCONNECTED') +
+      ' | Symbols: ' + data.subscribedSymbols +
+      ' | Scanning: ' + data.scanning +
+      ' | Last price: ' + (data.lastPriceAt || 'None') +
+      ' | Last error: ' + (data.lastError || 'None');
 
-    document.getElementById('markets').innerHTML=d.markets.map(m=>
-      '<tr><td>'+esc(m.market)+'</td><td>'+esc(m.status)+'</td>'+
-      '<td>'+esc(m.direction12H)+'</td><td>'+esc(m.direction1H)+'</td>'+
-      '<td>'+esc(m.fractal15M)+'</td><td>'+esc(m.retest15M)+'</td>'+
-      '<td>'+esc(m.confirm5M)+'</td><td>'+esc(price(m.entry))+'</td>'+
-      '<td>'+esc(price(m.stopLoss))+'</td><td>'+esc(price(m.takeProfit))+'</td>'+
-      '<td>'+esc(m.error||'')+'</td></tr>'
-    ).join('');
+    document.getElementById('markets').innerHTML =
+      data.markets.map(m => {
+        const cells = [
+          m.market,
+          price(m.price),
+          m.status,
+          m.direction12H,
+          m.direction1H,
+          m.fractal15M,
+          m.retest15M,
+          m.confirm5M,
+          price(m.entry),
+          price(m.stopLoss),
+          price(m.takeProfit),
+          m.error || ''
+        ];
 
-    document.getElementById('signals').innerHTML=d.signals.length
-      ? d.signals.map(s=>
-        '<div class="status"><b>'+esc(s.market)+' '+esc(s.direction)+'</b><br>'+
-        'Entry: '+esc(price(s.entry))+' | SL: '+esc(price(s.stopLoss))+
-        ' | TP: '+esc(price(s.takeProfit))+' | '+esc(s.createdAt)+'</div>'
-      ).join('')
-      : '<div class="muted">No confirmed signals yet.</div>';
+        return '<tr>' +
+          cells.map(v => '<td>' + esc(v) + '</td>').join('') +
+          '</tr>';
+      }).join('');
 
-    document.getElementById('logs').textContent=(d.logs||[]).join('\\n');
-  }catch(e){
-    document.getElementById('status').textContent='Dashboard error: '+e.message;
+    document.getElementById('signals').innerHTML =
+      data.signals.length
+        ? data.signals.map(s =>
+          '<div class="status">' +
+          esc(s.market) + ' ' +
+          esc(s.direction) +
+          ' | Entry: ' + esc(price(s.entry)) +
+          ' | SL: ' + esc(price(s.stopLoss)) +
+          ' | TP: ' + esc(price(s.takeProfit)) +
+          '</div>'
+        ).join('')
+        : 'No confirmed signals yet';
+
+    document.getElementById('logs').textContent =
+      data.logs.join('\\n');
+
+  } catch (error) {
+    document.getElementById('status').textContent =
+      'Dashboard error: ' + error.message;
   }
 }
 
-function esc(v){
-  return String(v==null?'':v).replace(/[&<>"']/g,c=>({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-  }[c]));
-}
+async function scanNow() {
+  try {
+    const response = await fetch('/api/scan', {
+      method:'POST'
+    });
+    const result = await response.json();
 
-function price(v){
-  if(v==null)return '—';
-  return Number(v).toPrecision(8).replace(/0+$/,'').replace(/\\.$/,'');
-}
+    if (!response.ok) {
+      alert(result.error || 'Scan failed');
+    }
 
-async function scanNow(){
-  try{
-    const r=await fetch('/api/scan',{method:'POST'});
-    const d=await r.json();
-    if(!r.ok)alert(d.error||'Scan request failed');
     refresh();
-  }catch(e){alert(e.message)}
+  } catch (error) {
+    alert(error.message);
+  }
 }
 
 refresh();
-setInterval(refresh,5000);
+setInterval(refresh, 5000);
 </script>
 </body>
-</html>`);
+</html>
+  `);
 });
 
-app.listen(PORT, () => {
-  log(`HTTP server listening on port ${PORT}`);
-  log(`Markets configured: ${MARKETS.length}`);
-  log('Signal-only mode enabled; no trades will be placed.');
-  connect();
-});
+const server = app.listen(
+  PORT,
+  '0.0.0.0',
+  () => {
+    log('SERVER STARTED ON PORT:', PORT);
+    log('CONFIGURED MARKETS:', MARKETS.length);
+    log('SIGNAL-ONLY MODE ENABLED');
+    connect();
+  }
+);
 
-process.on('uncaughtException', error => {
-  log('UNCAUGHT EXCEPTION:', error.stack || error.message);
+process.on('SIGTERM', () => {
+  clearInterval(heartbeat);
+  clearTimeout(scanTimer);
+  clearTimeout(reconnectTimer);
+
+  if (ws) ws.close();
+
+  server.close(() => process.exit(0));
 });
 
 process.on('unhandledRejection', error => {
-  log('UNHANDLED REJECTION:', error && (error.stack || error.message || error));
+  log('UNHANDLED REJECTION:', error.message);
 });
