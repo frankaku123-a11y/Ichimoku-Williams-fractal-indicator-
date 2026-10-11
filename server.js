@@ -14,7 +14,7 @@ const TIMEOUT = 20000;
 
 const WS_URLS = [
   'wss://ws.binaryws.com/websockets/v3',
-  'wss://ws.derivws.com/websockets/v3'
+  'wss://ws.derivws.com/websockets/v3?app_id=1086
 ];
 
 const MARKETS = [
