@@ -1,0 +1,9 @@
+{
+  "name": "deriv-ichimoku-fractal-signal-bot",
+  "version": "1.0.0",
+  "description": "Deriv market-data signal scanner using Ichimoku Cloud and Williams Fractals",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "express": "^4.21.2", "ws": "^8.18.0" }
+}
