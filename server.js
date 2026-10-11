@@ -11,7 +11,7 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const SCAN_INTERVAL_MS = Math.max(60000, Number(process.env.SCAN_INTERVAL_MS || 60000));
 const RISK_REWARD = Math.max(1, Number(process.env.RISK_REWARD || 2));
 const FRACTAL_N = 2;
-const WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(DERIV_APP_ID)}`;
+const WS_URL = `wss://frontend.binaryws.com/websockets/v3?app_id=${encodeURIComponent(DERIV_APP_ID)}`;
 
 // The first 10 are the pairs from the previous bot. The next 9 forex pairs,
 // gold, and three US indices make 23 requested markets in total.
