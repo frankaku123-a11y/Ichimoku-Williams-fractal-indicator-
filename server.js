@@ -122,7 +122,10 @@ function connectDeriv() {
     for (const [id, p] of pending) { clearTimeout(p.timer); p.reject(new Error('Deriv connection closed')); pending.delete(id); }
     reconnectTimer = setTimeout(connectDeriv, 5000);
   });
-  socket.on('error', err => { state.lastError = err.message; });
+  socket.on('error', err => {
+  state.lastError = err.message;
+  console.error('Deriv WebSocket error:', err.message);
+});
 }
 
 function resolveSymbols() {
