@@ -7,6 +7,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+const APP_ID = process.env.DERIV_APP_ID || '1089';
 const WS_URL = 'wss://ws.binaryws.com/websockets/v3';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
