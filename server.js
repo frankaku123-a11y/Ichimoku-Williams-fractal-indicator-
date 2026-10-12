@@ -7,82 +7,47 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const APP_ID = process.env.DERIV_APP_ID || '1086';
-
+const APP_ID = process.env.DERIV_APP_ID || '1089';
 
 const WS_URL =
-  `wss://ws.binaryws.com/websockets/v3?app_id=${APP_ID}`;
-
+  `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
 const CONFIG = {
-  scanIntervalMs: 60000,
+  scanIntervalMs: 300000,
   requestTimeoutMs: 20000,
   reconnectDelayMs: 3000,
   maxReconnectDelayMs: 30000,
   candleCount: 500,
   minimum12HCandles: 60,
-  minimumCandles: 60
+  minimumCandles: 60,
+  keepAliveMs: 30000,
+  staleConnectionMs: 90000
 };
 
-// Your original 33 requested markets.
-// Display names are resolved to Deriv's actual symbol codes.
 const MARKETS = [
-  'EUR/USD',
-  'GBP/USD',
-  'USD/JPY',
-  'USD/CHF',
-  'USD/CAD',
-  'AUD/USD',
-  'NZD/USD',
-  'EUR/GBP',
-  'EUR/JPY',
-  'GBP/JPY',
-  'AUD/JPY',
-  'CAD/JPY',
-  'CHF/JPY',
-  'NZD/JPY',
-  'EUR/AUD',
-  'EUR/CAD',
-  'EUR/CHF',
-  'EUR/NZD',
-  'GBP/AUD',
-  'GBP/CAD',
-  'GBP/CHF',
-  'GBP/NZD',
-  'AUD/CAD',
-  'AUD/CHF',
-  'AUD/NZD',
-  'CAD/CHF',
-  'NZD/CAD',
-  'NZD/CHF',
-  'XAU/USD',
-  'XAG/USD',
-  'US 100',
-  'US 500',
-  'US 30'
+  'EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF', 'USD/CAD',
+  'AUD/USD', 'NZD/USD', 'EUR/GBP', 'EUR/JPY', 'GBP/JPY',
+  'AUD/JPY', 'CAD/JPY', 'CHF/JPY', 'NZD/JPY', 'EUR/AUD',
+  'EUR/CAD', 'EUR/CHF', 'EUR/NZD', 'GBP/AUD', 'GBP/CAD',
+  'GBP/CHF', 'GBP/NZD', 'AUD/CAD', 'AUD/CHF', 'AUD/NZD',
+  'CAD/CHF', 'NZD/CAD', 'NZD/CHF', 'XAU/USD', 'XAG/USD',
+  'US 100', 'US 500', 'US 30'
 ];
 
 const ALIASES = {
-  'XAU/USD': [
-    'XAUUSD', 'GOLDUSD', 'GOLD'
-  ],
-  'XAG/USD': [
-    'XAGUSD', 'SILVERUSD', 'SILVER'
-  ],
+  'XAU/USD': ['XAUUSD', 'GOLDUSD', 'GOLD'],
+  'XAG/USD': ['XAGUSD', 'SILVERUSD', 'SILVER'],
   'US 100': [
-    'US100', 'USTECH100', 'NASDAQ100',
-    'NAS100', 'USNAS100'
+    'US100', 'USTECH100', 'NASDAQ100', 'NAS100', 'USNAS100'
   ],
   'US 500': [
-    'US500', 'USSP500', 'SP500',
-    'S&P500', 'US500INDEX'
+    'US500', 'USSP500', 'SP500', 'S&P500', 'US500INDEX'
   ],
   'US 30': [
-    'US30', 'WALLSTREET30',
-    'DOWJONES30', 'DJ30'
+    'US30', 'WALLSTREET30', 'DOWJONES30', 'DJ30'
   ]
 };
 
@@ -93,6 +58,7 @@ let reconnectTimer = null;
 let keepAliveTimer = null;
 let reconnectDelay = CONFIG.reconnectDelayMs;
 let nextRequestId = 1;
+let lastMessageAt = 0;
 
 const pending = new Map();
 const livePrices = {};
@@ -145,46 +111,35 @@ function resolveMarkets() {
 
   for (const requestedName of MARKETS) {
     const target = normalize(requestedName);
+
     const aliases = [
       target,
       ...(ALIASES[requestedName] || []).map(normalize)
     ];
 
-    let match = availableSymbols.find(item =>
-      aliases.includes(normalize(getDisplayName(item)))
-    );
+    let match = availableSymbols.find(item => {
+      const name = normalize(getDisplayName(item));
+      const code = normalize(getSymbolCode(item));
 
-    // Fallback for standard Forex and metal symbol codes.
-    if (!match) {
-      match = availableSymbols.find(item => {
-        const code = normalize(getSymbolCode(item));
+      return aliases.includes(name) ||
+        aliases.includes(code);
+    });
 
-        if (/^[A-Z]{6}$/.test(target)) {
-          return code.endsWith(target);
-        }
-
-        if (requestedName === 'XAU/USD') {
-          return code.endsWith('XAUUSD');
-        }
-
-        if (requestedName === 'XAG/USD') {
-          return code.endsWith('XAGUSD');
-        }
-
-        return false;
-      });
+    if (!match && /^[A-Z]{6}$/.test(target)) {
+      match = availableSymbols.find(item =>
+        normalize(getSymbolCode(item)).endsWith(target)
+      );
     }
 
-    // Index names vary between providers, so match known aliases.
     if (!match && ALIASES[requestedName]) {
       match = availableSymbols.find(item => {
         const name = normalize(getDisplayName(item));
         const code = normalize(getSymbolCode(item));
 
         return aliases.some(alias =>
-          name === alias ||
+          name.includes(alias) ||
           code === alias ||
-          (alias.length >= 5 && code.endsWith(alias))
+          code.endsWith(alias)
         );
       });
     }
@@ -203,10 +158,10 @@ function resolveMarkets() {
   resolvedMarkets = resolved;
   unavailableMarkets = missing;
 
-  log(`Resolved ${resolvedMarkets.length} of ${MARKETS.length} markets.`);
+  log(`Resolved ${resolved.length} of ${MARKETS.length} markets.`);
 
   if (missing.length) {
-    log(`Markets not found by Deriv: ${missing.join(', ')}`);
+    log(`Markets not found: ${missing.join(', ')}`);
   }
 
   return resolvedMarkets;
@@ -231,7 +186,11 @@ function request(payload) {
 
     const timer = setTimeout(() => {
       pending.delete(reqId);
-      reject(new Error('Deriv request timed out'));
+      reject(new Error(
+        `Deriv request timed out: ${
+          Object.keys(payload).join(', ')
+        }`
+      ));
     }, CONFIG.requestTimeoutMs);
 
     pending.set(reqId, { resolve, reject, timer });
@@ -249,6 +208,34 @@ function request(payload) {
   });
 }
 
+function sendPriceSubscriptions() {
+  if (!connected || !ws || !resolvedMarkets.length) return;
+
+  // Subscribe without waiting for each market's first price.
+  for (const market of resolvedMarkets) {
+    if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    const reqId = nextRequestId++;
+
+    try {
+      ws.send(JSON.stringify({
+        ticks: market.symbol,
+        subscribe: 1,
+        req_id: reqId
+      }));
+    } catch (error) {
+      log(
+        `Subscription send failed for ${market.requested}: ` +
+        error.message
+      );
+    }
+  }
+
+  log(`Requested live prices for ${resolvedMarkets.length} markets.`);
+}
+
 async function loadSymbols() {
   const response = await request({
     active_symbols: 'brief'
@@ -264,25 +251,13 @@ async function loadSymbols() {
 
   log(`Deriv returned ${availableSymbols.length} active symbols.`);
 
-  if (resolvedMarkets.length) {
-    subscribeToPrices();
-  }
+  sendPriceSubscriptions();
 }
 
-async function subscribeToPrices() {
-  if (!connected) return;
-
-  for (const market of resolvedMarkets) {
-    if (!connected) return;
-
-    try {
-      await request({
-        ticks: market.symbol,
-        subscribe: 1
-      });
-    } catch (error) {
-      log(`Price subscription failed for ${market.requested}: ${error.message}`);
-    }
+function stopKeepAlive() {
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
   }
 }
 
@@ -304,14 +279,51 @@ function scheduleReconnect() {
   );
 }
 
+function startKeepAlive() {
+  stopKeepAlive();
+
+  keepAliveTimer = setInterval(() => {
+    if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    // The Deriv API supports application-level ping requests.
+    try {
+      ws.send(JSON.stringify({ ping: 1 }));
+    } catch (error) {
+      log(`Ping failed: ${error.message}`);
+
+      try {
+        ws.terminate();
+      } catch {}
+      return;
+    }
+
+    // A silent connection should not remain marked as healthy.
+    if (
+      lastMessageAt &&
+      Date.now() - lastMessageAt > CONFIG.staleConnectionMs
+    ) {
+      log('Connection appears stale. Restarting WebSocket.');
+
+      try {
+        ws.terminate();
+      } catch {}
+    }
+  }, CONFIG.keepAliveMs);
+}
+
 function connect() {
   if (connecting || connected) return;
 
   connecting = true;
-  log('Connecting to Deriv...');
+  log(`Connecting to Deriv using app ID ${APP_ID}...`);
+
+  let socket;
 
   try {
-    ws = new WebSocket(WS_URL);
+    socket = new WebSocket(WS_URL);
+    ws = socket;
   } catch (error) {
     connecting = false;
     lastError = error.message;
@@ -320,34 +332,35 @@ function connect() {
     return;
   }
 
-  ws.on('open', async () => {
+  socket.on('open', async () => {
+    if (ws !== socket) return;
+
     connected = true;
     connecting = false;
     reconnectDelay = CONFIG.reconnectDelayMs;
     lastError = null;
+    lastMessageAt = Date.now();
 
     log('Deriv WebSocket connected.');
 
-    if (keepAliveTimer) clearInterval(keepAliveTimer);
-
-    // Prevent an idle WebSocket session from expiring.
-    keepAliveTimer = setInterval(() => {
-      if (!connected) return;
-
-      request({ time: 1 }).catch(error => {
-        log(`Keep-alive failed: ${error.message}`);
-      });
-    }, 30000);
+    startKeepAlive();
 
     try {
       await loadSymbols();
     } catch (error) {
       lastError = error.message;
       log(`Market setup failed: ${error.message}`);
+
+      // Reconnect if initial setup cannot be completed.
+      if (ws === socket) socket.terminate();
     }
   });
 
-  ws.on('message', raw => {
+  socket.on('message', raw => {
+    if (ws !== socket) return;
+
+    lastMessageAt = Date.now();
+
     let data;
 
     try {
@@ -359,11 +372,12 @@ function connect() {
 
     if (data.error) {
       const message = data.error.message || 'Unknown Deriv error';
+      const reqId = data.req_id;
 
-      if (data.req_id && pending.has(data.req_id)) {
-        const item = pending.get(data.req_id);
+      if (reqId && pending.has(reqId)) {
+        const item = pending.get(reqId);
         clearTimeout(item.timer);
-        pending.delete(data.req_id);
+        pending.delete(reqId);
         item.reject(new Error(message));
       } else {
         lastError = message;
@@ -397,12 +411,16 @@ function connect() {
     }
   });
 
-  ws.on('error', error => {
+  socket.on('error', error => {
+    if (ws !== socket) return;
+
     lastError = error.message;
     log(`WebSocket error: ${error.message}`);
   });
 
-  ws.on('close', (code, reason) => {
+  socket.on('close', (code, reason) => {
+    if (ws !== socket) return;
+
     connected = false;
     connecting = false;
 
@@ -411,18 +429,10 @@ function connect() {
       `${reason ? reason.toString() : 'No reason given'}`
     );
 
-    if (keepAliveTimer) {
-      clearInterval(keepAliveTimer);
-      keepAliveTimer = null;
-    }
-
+    stopKeepAlive();
     rejectPending(new Error('Deriv WebSocket disconnected'));
 
-    if (ws) {
-      ws.removeAllListeners();
-      ws = null;
-    }
-
+    ws = null;
     scheduleReconnect();
   });
 }
@@ -448,11 +458,12 @@ async function getCandles(symbol, granularity, count = 200) {
     low: Number(c.low),
     close: Number(c.close)
   })).filter(c =>
+    Number.isFinite(c.time) &&
     Number.isFinite(c.open) &&
     Number.isFinite(c.high) &&
     Number.isFinite(c.low) &&
     Number.isFinite(c.close)
-  );
+  ).sort((a, b) => a.time - b.time);
 }
 
 function aggregateCandles(candles, targetSeconds) {
@@ -525,7 +536,7 @@ function findFractals(candles) {
   const highs = [];
   const lows = [];
 
-  // The two candles to the right must exist to confirm a fractal.
+  // Two candles on the right confirm each Williams Fractal.
   for (let i = 2; i < candles.length - 2; i++) {
     const c = candles[i];
 
@@ -577,7 +588,6 @@ function findBreakoutRetest(candles, level, direction) {
   const latest = candles[lastIndex];
   const tolerance = averageRange(candles, 14) * 0.20;
 
-  // Look for a previous confirmed close beyond the fractal level.
   let breakoutIndex = -1;
 
   for (let i = Math.max(1, lastIndex - 6); i < lastIndex; i++) {
@@ -595,7 +605,6 @@ function findBreakoutRetest(candles, level, direction) {
     }
   }
 
-  // Require a later retest, not merely a breakout candle.
   if (breakoutIndex < 0 || breakoutIndex >= lastIndex) {
     return false;
   }
@@ -621,7 +630,6 @@ function evaluateSignal(
   const direction12h = ichimokuDirection(candles12h);
   const direction1h = ichimokuDirection(candles1h);
 
-  // Both higher timeframes must agree.
   if (
     direction12h === 'NEUTRAL' ||
     direction1h === 'NEUTRAL' ||
@@ -653,7 +661,6 @@ function evaluateSignal(
       return null;
     }
 
-    // Five-minute bullish confirmation.
     if (
       latest5.close <= latest5.open ||
       latest5.close <= previous5.close
@@ -662,7 +669,10 @@ function evaluateSignal(
     }
 
     entry = latest5.close;
-    stopLoss = Math.min(lastLow.price, candles15m[candles15m.length - 1].low);
+    stopLoss = Math.min(
+      lastLow.price,
+      candles15m[candles15m.length - 1].low
+    );
 
     if (stopLoss >= entry) return null;
 
@@ -676,7 +686,6 @@ function evaluateSignal(
       return null;
     }
 
-    // Five-minute bearish confirmation.
     if (
       latest5.close >= latest5.open ||
       latest5.close >= previous5.close
@@ -685,7 +694,10 @@ function evaluateSignal(
     }
 
     entry = latest5.close;
-    stopLoss = Math.max(lastHigh.price, candles15m[candles15m.length - 1].high);
+    stopLoss = Math.max(
+      lastHigh.price,
+      candles15m[candles15m.length - 1].high
+    );
 
     if (stopLoss <= entry) return null;
 
@@ -696,10 +708,8 @@ function evaluateSignal(
       '5M bearish confirmation';
   }
 
-  const digits = Math.max(
-    2,
-    Math.min(8, Number(market.displayName ? 5 : 5))
-  );
+  // Keep prices numeric; do not assume every market has 5 decimals.
+  const digits = 5;
 
   return {
     id: `${market.symbol}-${Date.now()}`,
@@ -734,7 +744,7 @@ async function sendTelegram(message) {
     );
 
     if (!response.ok) {
-      log(`Telegram notification returned HTTP ${response.status}`);
+      log(`Telegram returned HTTP ${response.status}`);
     }
   } catch (error) {
     log(`Telegram error: ${error.message}`);
@@ -742,7 +752,6 @@ async function sendTelegram(message) {
 }
 
 async function scanMarket(market) {
-  // Deriv supports 4-hour candles. Aggregate them into 12-hour candles.
   const candles4h = await getCandles(
     market.symbol,
     14400,
@@ -796,41 +805,39 @@ async function runScan() {
   const errors = [];
 
   try {
-    // Scan sequentially to avoid flooding the WebSocket with requests.
     for (const market of resolvedMarkets) {
       if (!connected) break;
 
       try {
         const signal = await scanMarket(market);
 
-        if (signal) {
-          found.push(signal);
+        if (!signal) continue;
 
-          const duplicate = signals.some(existing =>
-            existing.symbol === signal.symbol &&
-            existing.direction === signal.direction &&
-            Date.now() - new Date(existing.time).getTime() <
-              15 * 60 * 1000
-          );
+        const duplicate = signals.some(existing =>
+          existing.symbol === signal.symbol &&
+          existing.direction === signal.direction &&
+          Date.now() - new Date(existing.time).getTime() <
+            15 * 60 * 1000
+        );
 
-          if (!duplicate) {
-            signals.unshift(signal);
+        if (duplicate) continue;
 
-            if (signals.length > 100) signals.length = 100;
+        found.push(signal);
+        signals.unshift(signal);
 
-            await sendTelegram(
-              `Deriv signal: ${signal.direction}\n` +
-              `Market: ${signal.market}\n` +
-              `Symbol: ${signal.symbol}\n` +
-              `Entry: ${signal.entry}\n` +
-              `Stop Loss: ${signal.stopLoss}\n` +
-              `Take Profit: ${signal.takeProfit}\n` +
-              `Risk/Reward: 1:2\n` +
-              `Strategy: ${signal.strategy}\n` +
-              `Signal only. No trade was placed.`
-            );
-          }
-        }
+        if (signals.length > 100) signals.length = 100;
+
+        await sendTelegram(
+          `Deriv signal: ${signal.direction}\n` +
+          `Market: ${signal.market}\n` +
+          `Symbol: ${signal.symbol}\n` +
+          `Entry: ${signal.entry}\n` +
+          `Stop Loss: ${signal.stopLoss}\n` +
+          `Take Profit: ${signal.takeProfit}\n` +
+          `Risk/Reward: 1:2\n` +
+          `Strategy: ${signal.strategy}\n` +
+          `Signal only. No trade was placed.`
+        );
       } catch (error) {
         errors.push({
           market: market.requested,
@@ -897,16 +904,12 @@ async function refresh(){
 
   document.getElementById('prices').textContent =
    JSON.stringify(d.livePrices,null,2);
-
   document.getElementById('markets').textContent =
    JSON.stringify(d.resolvedMarkets,null,2);
-
   document.getElementById('missing').textContent =
    JSON.stringify(d.unavailableMarkets,null,2);
-
   document.getElementById('signals').textContent =
    JSON.stringify(d.signals,null,2);
-
   document.getElementById('logs').textContent =
    JSON.stringify(d.logs.slice(0,15),null,2);
  }catch(e){
@@ -995,7 +998,6 @@ app.listen(PORT, '0.0.0.0', () => {
   connect();
 });
 
-// Run scans periodically. A long scan is never overlapped.
 setInterval(() => {
   if (connected && !scanRunning) {
     runScan().catch(error => {
@@ -1009,7 +1011,9 @@ process.on('SIGTERM', () => {
   log('Shutting down.');
 
   if (reconnectTimer) clearTimeout(reconnectTimer);
-  if (keepAliveTimer) clearInterval(keepAliveTimer);
+  stopKeepAlive();
+
+  rejectPending(new Error('Server shutting down'));
 
   if (ws) {
     try {
