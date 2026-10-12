@@ -1,3 +1,4 @@
+
 'use strict';
 
 const express = require('express');
@@ -6,18 +7,21 @@ const WebSocket = require('ws');
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const APP_ID = process.env.DERIV_APP_ID || '1089';
-const WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
+
+const WS_URL =
+  `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
 const CONFIG = {
   scanIntervalMs: 300000,
-  requestTimeoutMs: 20000,
+  requestTimeoutMs: 25000,
+  connectionTimeoutMs: 20000,
   reconnectDelayMs: 3000,
-  maxReconnectDelayMs: 30000,
+  maxReconnectDelayMs: 60000,
   candleCount: 500,
   minimum12HCandles: 60,
   minimumCandles: 60,
@@ -54,6 +58,7 @@ let connected = false;
 let connecting = false;
 let reconnectTimer = null;
 let keepAliveTimer = null;
+let connectionTimer = null;
 let reconnectDelay = CONFIG.reconnectDelayMs;
 let nextRequestId = 1;
 let lastMessageAt = 0;
@@ -185,9 +190,7 @@ function request(payload) {
     const timer = setTimeout(() => {
       pending.delete(reqId);
       reject(new Error(
-        `Deriv request timed out: ${
-          Object.keys(payload).join(', ')
-        }`
+        `Deriv request timed out: ${Object.keys(payload).join(', ')}`
       ));
     }, CONFIG.requestTimeoutMs);
 
@@ -209,7 +212,6 @@ function request(payload) {
 function sendPriceSubscriptions() {
   if (!connected || !ws || !resolvedMarkets.length) return;
 
-  // Subscribe without waiting for each market's first price.
   for (const market of resolvedMarkets) {
     if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
       return;
@@ -225,8 +227,7 @@ function sendPriceSubscriptions() {
       }));
     } catch (error) {
       log(
-        `Subscription send failed for ${market.requested}: ` +
-        error.message
+        `Subscription failed for ${market.requested}: ${error.message}`
       );
     }
   }
@@ -259,6 +260,13 @@ function stopKeepAlive() {
   }
 }
 
+function clearConnectionTimeout() {
+  if (connectionTimer) {
+    clearTimeout(connectionTimer);
+    connectionTimer = null;
+  }
+}
+
 function scheduleReconnect() {
   if (reconnectTimer) return;
 
@@ -285,7 +293,6 @@ function startKeepAlive() {
       return;
     }
 
-    // The Deriv API supports application-level ping requests.
     try {
       ws.send(JSON.stringify({ ping: 1 }));
     } catch (error) {
@@ -294,10 +301,10 @@ function startKeepAlive() {
       try {
         ws.terminate();
       } catch {}
+
       return;
     }
 
-    // A silent connection should not remain marked as healthy.
     if (
       lastMessageAt &&
       Date.now() - lastMessageAt > CONFIG.staleConnectionMs
@@ -315,23 +322,45 @@ function connect() {
   if (connecting || connected) return;
 
   connecting = true;
+
   log(`Connecting to Deriv using app ID ${APP_ID}...`);
+  log('WebSocket endpoint: ws.derivws.com');
 
   let socket;
 
   try {
-    socket = new WebSocket(WS_URL);
+    socket = new WebSocket(WS_URL, {
+      handshakeTimeout: CONFIG.connectionTimeoutMs,
+      perMessageDeflate: false
+    });
+
     ws = socket;
   } catch (error) {
     connecting = false;
     lastError = error.message;
+
     log(`WebSocket creation failed: ${error.message}`);
+
     scheduleReconnect();
     return;
   }
 
+  connectionTimer = setTimeout(() => {
+    if (ws !== socket || socket.readyState !== WebSocket.CONNECTING) {
+      return;
+    }
+
+    lastError = 'WebSocket connection timed out';
+
+    log('WebSocket connection timed out.');
+
+    socket.terminate();
+  }, CONFIG.connectionTimeoutMs + 1000);
+
   socket.on('open', async () => {
     if (ws !== socket) return;
+
+    clearConnectionTimeout();
 
     connected = true;
     connecting = false;
@@ -347,10 +376,12 @@ function connect() {
       await loadSymbols();
     } catch (error) {
       lastError = error.message;
+
       log(`Market setup failed: ${error.message}`);
 
-      // Reconnect if initial setup cannot be completed.
-      if (ws === socket) socket.terminate();
+      if (ws === socket) {
+        socket.terminate();
+      }
     }
   });
 
@@ -374,8 +405,10 @@ function connect() {
 
       if (reqId && pending.has(reqId)) {
         const item = pending.get(reqId);
+
         clearTimeout(item.timer);
         pending.delete(reqId);
+
         item.reject(new Error(message));
       } else {
         lastError = message;
@@ -388,47 +421,68 @@ function connect() {
     if (data.msg_type === 'tick' && data.tick) {
       const tick = data.tick;
 
-      livePrices[tick.symbol] = {
-        symbol: tick.symbol,
-        price: Number(tick.quote),
-        epoch: tick.epoch,
-        time: new Date(tick.epoch * 1000).toISOString()
-      };
-    }
+      const epoch = Number(tick.epoch);
+      const price = Number(tick.quote);
 
-    if (data.msg_type === 'active_symbols' && data.active_symbols) {
-      availableSymbols = data.active_symbols;
-      resolveMarkets();
+      if (Number.isFinite(epoch) && Number.isFinite(price)) {
+        livePrices[tick.symbol] = {
+          symbol: tick.symbol,
+          price,
+          epoch,
+          time: new Date(epoch * 1000).toISOString()
+        };
+      }
     }
 
     if (data.req_id && pending.has(data.req_id)) {
       const item = pending.get(data.req_id);
+
       clearTimeout(item.timer);
       pending.delete(data.req_id);
+
       item.resolve(data);
     }
   });
-socket.on('error', error => {
-  if (ws !== socket) return;
 
-  lastError = error.message;
+  socket.on('unexpected-response', (request, response) => {
+    if (ws !== socket) return;
 
-  log(`WebSocket error: ${error.message}`);
-  log(`Error code: ${error.code || 'unknown'}`);
-  log(`HTTP status: ${error.statusCode || 'unknown'}`);
-  log(`Connection URL: ${WS_URL}`);
-});
+    const status = response.statusCode;
 
-socket.on('unexpected-response', (request, response) => {
-  if (ws !== socket) return;
+    lastError = `WebSocket handshake rejected: HTTP ${status}`;
 
-  log(`WebSocket handshake rejected: HTTP ${response.statusCode}`);
-  log(`Response server: ${response.headers.server || 'unknown'}`);
-});
-  
+    log(`WebSocket handshake rejected: HTTP ${status}`);
+    log(`Response server: ${response.headers.server || 'unknown'}`);
+    log(`Response content type: ${response.headers['content-type'] || 'unknown'}`);
+
+    // This response is not a successful WebSocket upgrade.
+    // Close it so the normal close/reconnect path can run.
+    response.resume();
+
+    if (request && !request.destroyed) {
+      request.destroy();
+    }
+
+    if (socket.readyState !== WebSocket.CLOSED) {
+      socket.terminate();
+    }
+  });
+
+  socket.on('error', error => {
+    if (ws !== socket) return;
+
+    lastError = error.message;
+
+    log(`WebSocket error: ${error.message}`);
+    log(`Error code: ${error.code || 'unknown'}`);
+    log(`HTTP status: ${error.statusCode || 'unknown'}`);
+  });
 
   socket.on('close', (code, reason) => {
     if (ws !== socket) return;
+
+    clearConnectionTimeout();
+    stopKeepAlive();
 
     connected = false;
     connecting = false;
@@ -438,7 +492,6 @@ socket.on('unexpected-response', (request, response) => {
       `${reason ? reason.toString() : 'No reason given'}`
     );
 
-    stopKeepAlive();
     rejectPending(new Error('Deriv WebSocket disconnected'));
 
     ws = null;
@@ -492,6 +545,7 @@ function aggregateCandles(candles, targetSeconds) {
       });
     } else {
       const group = groups.get(bucket);
+
       group.high = Math.max(group.high, candle.high);
       group.low = Math.min(group.low, candle.low);
       group.close = candle.close;
@@ -545,7 +599,6 @@ function findFractals(candles) {
   const highs = [];
   const lows = [];
 
-  // Two candles on the right confirm each Williams Fractal.
   for (let i = 2; i < candles.length - 2; i++) {
     const c = candles[i];
 
@@ -660,6 +713,8 @@ function evaluateSignal(
   const latest5 = candles5m[candles5m.length - 1];
   const previous5 = candles5m[candles5m.length - 2];
 
+  if (!latest5 || !previous5) return null;
+
   let entry;
   let stopLoss;
   let takeProfit;
@@ -678,6 +733,7 @@ function evaluateSignal(
     }
 
     entry = latest5.close;
+
     stopLoss = Math.min(
       lastLow.price,
       candles15m[candles15m.length - 1].low
@@ -703,6 +759,7 @@ function evaluateSignal(
     }
 
     entry = latest5.close;
+
     stopLoss = Math.max(
       lastHigh.price,
       candles15m[candles15m.length - 1].high
@@ -717,7 +774,6 @@ function evaluateSignal(
       '5M bearish confirmation';
   }
 
-  // Keep prices numeric; do not assume every market has 5 decimals.
   const digits = 5;
 
   return {
@@ -1020,6 +1076,8 @@ process.on('SIGTERM', () => {
   log('Shutting down.');
 
   if (reconnectTimer) clearTimeout(reconnectTimer);
+
+  clearConnectionTimeout();
   stopKeepAlive();
 
   rejectPending(new Error('Server shutting down'));
