@@ -408,13 +408,24 @@ function connect() {
       item.resolve(data);
     }
   });
+socket.on('error', error => {
+  if (ws !== socket) return;
 
-  socket.on('error', error => {
-    if (ws !== socket) return;
+  lastError = error.message;
 
-    lastError = error.message;
-    log(`WebSocket error: ${error.message}`);
-  });
+  log(`WebSocket error: ${error.message}`);
+  log(`Error code: ${error.code || 'unknown'}`);
+  log(`HTTP status: ${error.statusCode || 'unknown'}`);
+  log(`Connection URL: ${WS_URL}`);
+});
+
+socket.on('unexpected-response', (request, response) => {
+  if (ws !== socket) return;
+
+  log(`WebSocket handshake rejected: HTTP ${response.statusCode}`);
+  log(`Response server: ${response.headers.server || 'unknown'}`);
+});
+  
 
   socket.on('close', (code, reason) => {
     if (ws !== socket) return;
