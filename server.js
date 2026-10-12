@@ -1,4 +1,3 @@
-
 'use strict';
 
 const express = require('express');
@@ -8,10 +7,9 @@ const app = express();
 app.use(express.json());
 
 const PORT = Number(process.env.PORT) || 3000;
-const APP_ID = process.env.DERIV_APP_ID || '1089';
 
-const WS_URL =
-  `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
+// New Deriv public endpoint (no app ID needed)
+const WS_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
@@ -23,8 +21,8 @@ const CONFIG = {
   reconnectDelayMs: 3000,
   maxReconnectDelayMs: 60000,
   candleCount: 500,
-  minimum12HCandles: 60,
-  minimumCandles: 60,
+  minimum12HCandles: 80,
+  minimumCandles: 80,
   keepAliveMs: 30000,
   staleConnectionMs: 90000
 };
@@ -42,15 +40,9 @@ const MARKETS = [
 const ALIASES = {
   'XAU/USD': ['XAUUSD', 'GOLDUSD', 'GOLD'],
   'XAG/USD': ['XAGUSD', 'SILVERUSD', 'SILVER'],
-  'US 100': [
-    'US100', 'USTECH100', 'NASDAQ100', 'NAS100', 'USNAS100'
-  ],
-  'US 500': [
-    'US500', 'USSP500', 'SP500', 'S&P500', 'US500INDEX'
-  ],
-  'US 30': [
-    'US30', 'WALLSTREET30', 'DOWJONES30', 'DJ30'
-  ]
+  'US 100': ['US100', 'USTECH100', 'NASDAQ100', 'NAS100', 'USNAS100'],
+  'US 500': ['US500', 'USSP500', 'SP500', 'S&P500', 'US500INDEX'],
+  'US 30': ['US30', 'WALLSTREET30', 'DOWJONES30', 'DJ30']
 };
 
 let ws = null;
@@ -108,6 +100,16 @@ function getDisplayName(item) {
     '';
 }
 
+function getDecimals(market) {
+  const name = String(market || '').toUpperCase();
+
+  if (name === 'XAU/USD' || name === 'XAG/USD') return 3;
+  if (name.startsWith('US ')) return 2;
+  if (name.includes('JPY')) return 3;
+
+  return 5;
+}
+
 function resolveMarkets() {
   const resolved = [];
   const missing = [];
@@ -124,8 +126,7 @@ function resolveMarkets() {
       const name = normalize(getDisplayName(item));
       const code = normalize(getSymbolCode(item));
 
-      return aliases.includes(name) ||
-        aliases.includes(code);
+      return aliases.includes(name) || aliases.includes(code);
     });
 
     if (!match && /^[A-Z]{6}$/.test(target)) {
@@ -226,9 +227,7 @@ function sendPriceSubscriptions() {
         req_id: reqId
       }));
     } catch (error) {
-      log(
-        `Subscription failed for ${market.requested}: ${error.message}`
-      );
+      log(`Subscription failed for ${market.requested}: ${error.message}`);
     }
   }
 
@@ -323,8 +322,8 @@ function connect() {
 
   connecting = true;
 
-  log(`Connecting to Deriv using app ID ${APP_ID}...`);
-  log('WebSocket endpoint: ws.derivws.com');
+  log('Connecting to Deriv...');
+  log('WebSocket endpoint: api.derivws.com');
 
   let socket;
 
@@ -444,7 +443,7 @@ function connect() {
     }
   });
 
-  socket.on('unexpected-response', (request, response) => {
+  socket.on('unexpected-response', (req, response) => {
     if (ws !== socket) return;
 
     const status = response.statusCode;
@@ -455,12 +454,10 @@ function connect() {
     log(`Response server: ${response.headers.server || 'unknown'}`);
     log(`Response content type: ${response.headers['content-type'] || 'unknown'}`);
 
-    // This response is not a successful WebSocket upgrade.
-    // Close it so the normal close/reconnect path can run.
     response.resume();
 
-    if (request && !request.destroyed) {
-      request.destroy();
+    if (req && !req.destroyed) {
+      req.destroy();
     }
 
     if (socket.readyState !== WebSocket.CLOSED) {
@@ -513,19 +510,28 @@ async function getCandles(symbol, granularity, count = 200) {
     throw new Error(`No candle data returned for ${symbol}`);
   }
 
-  return response.candles.map(c => ({
-    time: Number(c.epoch),
-    open: Number(c.open),
-    high: Number(c.high),
-    low: Number(c.low),
-    close: Number(c.close)
-  })).filter(c =>
-    Number.isFinite(c.time) &&
-    Number.isFinite(c.open) &&
-    Number.isFinite(c.high) &&
-    Number.isFinite(c.low) &&
-    Number.isFinite(c.close)
-  ).sort((a, b) => a.time - b.time);
+  return response.candles
+    .map(c => ({
+      time: Number(c.epoch),
+      open: Number(c.open),
+      high: Number(c.high),
+      low: Number(c.low),
+      close: Number(c.close)
+    }))
+    .filter(c =>
+      Number.isFinite(c.time) &&
+      Number.isFinite(c.open) &&
+      Number.isFinite(c.high) &&
+      Number.isFinite(c.low) &&
+      Number.isFinite(c.close)
+    )
+    .sort((a, b) => a.time - b.time);
+}
+
+// Fetch candles and remove the still-forming last candle
+async function getClosedCandles(symbol, granularity, count) {
+  const candles = await getCandles(symbol, granularity, count);
+  return candles.slice(0, -1);
 }
 
 function aggregateCandles(candles, targetSeconds) {
@@ -571,16 +577,28 @@ function midpoint(candles, period, endIndex) {
   return (high + low) / 2;
 }
 
+// Ichimoku with the 26-period forward shift of the cloud,
+// so the cloud matches what TradingView draws at the current candle.
 function ichimokuDirection(candles) {
-  if (candles.length < 52) return 'NEUTRAL';
+  const DISPLACEMENT = 26;
+
+  if (candles.length < 52 + DISPLACEMENT) return 'NEUTRAL';
 
   const i = candles.length - 1;
   const close = candles[i].close;
 
   const tenkan = midpoint(candles, 9, i);
   const kijun = midpoint(candles, 26, i);
-  const spanA = (tenkan + kijun) / 2;
-  const spanB = midpoint(candles, 52, i);
+
+  // Cloud at the current candle was calculated 26 candles ago
+  const cloudIndex = i - DISPLACEMENT;
+  const pastTenkan = midpoint(candles, 9, cloudIndex);
+  const pastKijun = midpoint(candles, 26, cloudIndex);
+  const spanA =
+    pastTenkan !== null && pastKijun !== null
+      ? (pastTenkan + pastKijun) / 2
+      : null;
+  const spanB = midpoint(candles, 52, cloudIndex);
 
   if ([tenkan, kijun, spanA, spanB].some(v => v === null)) {
     return 'NEUTRAL';
@@ -608,11 +626,7 @@ function findFractals(candles) {
       c.high > candles[i + 1].high &&
       c.high > candles[i + 2].high
     ) {
-      highs.push({
-        index: i,
-        price: c.high,
-        time: c.time
-      });
+      highs.push({ index: i, price: c.high, time: c.time });
     }
 
     if (
@@ -621,11 +635,7 @@ function findFractals(candles) {
       c.low < candles[i + 1].low &&
       c.low < candles[i + 2].low
     ) {
-      lows.push({
-        index: i,
-        price: c.low,
-        time: c.time
-      });
+      lows.push({ index: i, price: c.low, time: c.time });
     }
   }
 
@@ -774,7 +784,7 @@ function evaluateSignal(
       '5M bearish confirmation';
   }
 
-  const digits = 5;
+  const digits = getDecimals(market.requested);
 
   return {
     id: `${market.symbol}-${Date.now()}`,
@@ -817,7 +827,8 @@ async function sendTelegram(message) {
 }
 
 async function scanMarket(market) {
-  const candles4h = await getCandles(
+  // All candles below exclude the still-forming candle
+  const candles4h = await getClosedCandles(
     market.symbol,
     14400,
     CONFIG.candleCount
@@ -825,9 +836,9 @@ async function scanMarket(market) {
 
   const candles12h = aggregateCandles(candles4h, 43200);
 
-  const candles1h = await getCandles(market.symbol, 3600, 200);
-  const candles15m = await getCandles(market.symbol, 900, 200);
-  const candles5m = await getCandles(market.symbol, 300, 200);
+  const candles1h = await getClosedCandles(market.symbol, 3600, 200);
+  const candles15m = await getClosedCandles(market.symbol, 900, 200);
+  const candles5m = await getClosedCandles(market.symbol, 300, 200);
 
   if (
     candles12h.length < CONFIG.minimum12HCandles ||
