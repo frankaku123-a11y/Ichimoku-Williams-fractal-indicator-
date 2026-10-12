@@ -18,9 +18,9 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const TWELVE_KEY = process.env.TWELVE_DATA_API_KEY || '';
 
 const INDEX_MARKETS = [
-  { requested: 'US 100', symbol: 'NDX', htfLabel: '1D' },
-  { requested: 'US 500', symbol: 'SPX', htfLabel: '1D' },
-  { requested: 'US 30', symbol: 'DJI', htfLabel: '1D' }
+  { requested: 'US 100 (QQQ)', symbol: 'QQQ', htfLabel: '1D' },
+  { requested: 'US 500 (SPY)', symbol: 'SPY', htfLabel: '1D' },
+  { requested: 'US 30 (DIA)', symbol: 'DIA', htfLabel: '1D' }
 ];
 
 const indexCache = new Map();
@@ -889,8 +889,29 @@ function isUsMarketOpen() {
   return minutes >= 570 && minutes < 960;
 }
 
+// Free plan allows 8 requests per minute: stay at 7 or fewer
+const twelveCalls = [];
+
+async function twelveThrottle() {
+  while (true) {
+    const now = Date.now();
+
+    while (twelveCalls.length && now - twelveCalls[0] > 60000) {
+      twelveCalls.shift();
+    }
+
+    if (twelveCalls.length < 7) break;
+
+    await sleep(60000 - (now - twelveCalls[0]) + 100);
+  }
+
+  twelveCalls.push(Date.now());
+}
+
 // Fetch candles from Twelve Data and drop the still-forming last candle
 async function getTwelveCandles(symbol, interval, size) {
+  await twelveThrottle();
+
   const url = new URL('https://api.twelvedata.com/time_series');
 
   url.searchParams.set('symbol', symbol);
