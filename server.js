@@ -14,6 +14,17 @@ const WS_URL = 'wss://api.derivws.com/trading/v1/options/ws/public';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
+// Second data source for US indices (Twelve Data)
+const TWELVE_KEY = process.env.TWELVE_DATA_API_KEY || '';
+
+const INDEX_MARKETS = [
+  { requested: 'US 100', symbol: 'NDX', htfLabel: '1D' },
+  { requested: 'US 500', symbol: 'SPX', htfLabel: '1D' },
+  { requested: 'US 30', symbol: 'DJI', htfLabel: '1D' }
+];
+
+const indexCache = new Map();
+
 const CONFIG = {
   scanIntervalMs: 300000,
   requestTimeoutMs: 25000,
@@ -33,16 +44,12 @@ const MARKETS = [
   'AUD/JPY', 'CAD/JPY', 'CHF/JPY', 'NZD/JPY', 'EUR/AUD',
   'EUR/CAD', 'EUR/CHF', 'EUR/NZD', 'GBP/AUD', 'GBP/CAD',
   'GBP/CHF', 'GBP/NZD', 'AUD/CAD', 'AUD/CHF', 'AUD/NZD',
-  'CAD/CHF', 'NZD/CAD', 'NZD/CHF', 'XAU/USD', 'XAG/USD',
-  'US 100', 'US 500', 'US 30'
+  'CAD/CHF', 'NZD/CAD', 'NZD/CHF', 'XAU/USD', 'XAG/USD'
 ];
 
 const ALIASES = {
   'XAU/USD': ['XAUUSD', 'GOLDUSD', 'GOLD'],
-  'XAG/USD': ['XAGUSD', 'SILVERUSD', 'SILVER'],
-  'US 100': ['US100', 'USTECH100', 'NASDAQ100', 'NAS100', 'USNAS100'],
-  'US 500': ['US500', 'USSP500', 'SP500', 'S&P500', 'US500INDEX'],
-  'US 30': ['US30', 'WALLSTREET30', 'DOWJONES30', 'DJ30']
+  'XAG/USD': ['XAGUSD', 'SILVERUSD', 'SILVER']
 };
 
 let ws = null;
@@ -754,7 +761,7 @@ function evaluateSignal(
     takeProfit = entry + 2 * (entry - stopLoss);
 
     reason =
-      '12H/1H Ichimoku bullish; 15M fractal breakout and retest; ' +
+      (market.htfLabel || '12H') + '/1H Ichimoku bullish; 15M fractal breakout and retest; ' +
       '5M bullish confirmation';
   } else {
     if (!findBreakoutRetest(candles15m, lastLow.price, 'SELL')) {
@@ -780,7 +787,7 @@ function evaluateSignal(
     takeProfit = entry - 2 * (stopLoss - entry);
 
     reason =
-      '12H/1H Ichimoku bearish; 15M fractal breakout and retest; ' +
+      (market.htfLabel || '12H') + '/1H Ichimoku bearish; 15M fractal breakout and retest; ' +
       '5M bearish confirmation';
   }
 
@@ -858,18 +865,185 @@ async function scanMarket(market) {
   );
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// US cash session: Mon-Fri 9:30-16:00 New York time
+function isUsMarketOpen() {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'short',
+    hour: 'numeric',
+    minute: 'numeric',
+    hour12: false
+  }).formatToParts(new Date());
+
+  const get = type => parts.find(p => p.type === type).value;
+  const day = get('weekday');
+
+  if (day === 'Sat' || day === 'Sun') return false;
+
+  const minutes = (Number(get('hour')) % 24) * 60 + Number(get('minute'));
+
+  return minutes >= 570 && minutes < 960;
+}
+
+// Fetch candles from Twelve Data and drop the still-forming last candle
+async function getTwelveCandles(symbol, interval, size) {
+  const url = new URL('https://api.twelvedata.com/time_series');
+
+  url.searchParams.set('symbol', symbol);
+  url.searchParams.set('interval', interval);
+  url.searchParams.set('outputsize', String(size));
+  url.searchParams.set('timezone', 'UTC');
+  url.searchParams.set('order', 'ASC');
+  url.searchParams.set('apikey', TWELVE_KEY);
+
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(20000)
+  });
+
+  const data = await response.json();
+
+  if (data.status === 'error' || !Array.isArray(data.values)) {
+    throw new Error(`Twelve Data: ${data.message || 'no data returned'}`);
+  }
+
+  const candles = data.values
+    .map(v => {
+      const iso = v.datetime.length > 10
+        ? v.datetime.replace(' ', 'T') + 'Z'
+        : v.datetime + 'T00:00:00Z';
+
+      return {
+        time: Math.floor(new Date(iso).getTime() / 1000),
+        open: Number(v.open),
+        high: Number(v.high),
+        low: Number(v.low),
+        close: Number(v.close)
+      };
+    })
+    .filter(c =>
+      Number.isFinite(c.time) &&
+      Number.isFinite(c.open) &&
+      Number.isFinite(c.high) &&
+      Number.isFinite(c.low) &&
+      Number.isFinite(c.close)
+    )
+    .sort((a, b) => a.time - b.time);
+
+  return candles.slice(0, -1);
+}
+
+// Slow timeframes are cached to save API credits
+async function getCachedTwelveCandles(symbol, interval, size, ttlMs) {
+  const key = `${symbol}|${interval}`;
+  const cached = indexCache.get(key);
+
+  if (cached && Date.now() - cached.time < ttlMs) {
+    return cached.candles;
+  }
+
+  const candles = await getTwelveCandles(symbol, interval, size);
+
+  indexCache.set(key, { time: Date.now(), candles });
+
+  return candles;
+}
+
+async function scanIndex(market) {
+  const daily = await getCachedTwelveCandles(
+    market.symbol, '1day', 120, 6 * 60 * 60 * 1000
+  );
+
+  const candles1h = await getCachedTwelveCandles(
+    market.symbol, '1h', 200, 60 * 60 * 1000
+  );
+
+  if (
+    daily.length < CONFIG.minimumCandles ||
+    candles1h.length < CONFIG.minimumCandles
+  ) {
+    throw new Error('Not enough historical candles');
+  }
+
+  const dailyDirection = ichimokuDirection(daily);
+  const hourDirection = ichimokuDirection(candles1h);
+
+  // Only spend credits on 15M/5M when the bigger trend agrees
+  if (
+    dailyDirection === 'NEUTRAL' ||
+    hourDirection === 'NEUTRAL' ||
+    dailyDirection !== hourDirection
+  ) {
+    return null;
+  }
+
+  const candles15m = await getTwelveCandles(market.symbol, '15min', 200);
+  const candles5m = await getTwelveCandles(market.symbol, '5min', 200);
+
+  if (
+    candles15m.length < CONFIG.minimumCandles ||
+    candles5m.length < CONFIG.minimumCandles
+  ) {
+    throw new Error('Not enough historical candles');
+  }
+
+  // Skip stale data (holiday or early close)
+  const lastTime = candles5m[candles5m.length - 1].time;
+
+  if (Date.now() / 1000 - lastTime > 30 * 60) return null;
+
+  return evaluateSignal(
+    market,
+    daily,
+    candles1h,
+    candles15m,
+    candles5m
+  );
+}
+
+async function recordSignal(signal, found) {
+  const duplicate = signals.some(existing =>
+    existing.symbol === signal.symbol &&
+    existing.direction === signal.direction &&
+    Date.now() - new Date(existing.time).getTime() < 15 * 60 * 1000
+  );
+
+  if (duplicate) return;
+
+  found.push(signal);
+  signals.unshift(signal);
+
+  if (signals.length > 100) signals.length = 100;
+
+  await sendTelegram(
+    `Signal: ${signal.direction}\n` +
+    `Market: ${signal.market}\n` +
+    `Symbol: ${signal.symbol}\n` +
+    `Entry: ${signal.entry}\n` +
+    `Stop Loss: ${signal.stopLoss}\n` +
+    `Take Profit: ${signal.takeProfit}\n` +
+    `Risk/Reward: 1:2\n` +
+    `Strategy: ${signal.strategy}\n` +
+    `Signal only. No trade was placed.`
+  );
+}
+
 async function runScan() {
   if (scanRunning) {
     return { message: 'A scan is already running.' };
   }
 
-  if (!connected) {
-    return { error: 'Deriv is not connected.' };
-  }
+  const scanIndices = Boolean(TWELVE_KEY) && isUsMarketOpen();
+  const scanDeriv = connected && resolvedMarkets.length > 0;
 
-  if (!resolvedMarkets.length) {
+  if (!scanDeriv && !scanIndices) {
     return {
-      error: 'No requested markets were resolved.',
+      error: connected
+        ? 'No requested markets were resolved.'
+        : 'Deriv is not connected.',
       unavailableMarkets
     };
   }
@@ -879,56 +1053,64 @@ async function runScan() {
 
   const found = [];
   const errors = [];
+  let scanned = 0;
+  let indicesScanned = 0;
 
   try {
-    for (const market of resolvedMarkets) {
-      if (!connected) break;
+    if (scanDeriv) {
+      for (const market of resolvedMarkets) {
+        if (!connected) break;
 
-      try {
-        const signal = await scanMarket(market);
+        try {
+          const signal = await scanMarket(market);
 
-        if (!signal) continue;
+          scanned++;
 
-        const duplicate = signals.some(existing =>
-          existing.symbol === signal.symbol &&
-          existing.direction === signal.direction &&
-          Date.now() - new Date(existing.time).getTime() <
-            15 * 60 * 1000
-        );
+          if (signal) await recordSignal(signal, found);
+        } catch (error) {
+          errors.push({
+            market: market.requested,
+            symbol: market.symbol,
+            error: error.message
+          });
 
-        if (duplicate) continue;
+          log(`Scan failed for ${market.requested}: ${error.message}`);
+        }
+      }
+    }
 
-        found.push(signal);
-        signals.unshift(signal);
+    if (scanIndices) {
+      for (const market of INDEX_MARKETS) {
+        try {
+          const signal = await scanIndex(market);
 
-        if (signals.length > 100) signals.length = 100;
+          indicesScanned++;
 
-        await sendTelegram(
-          `Deriv signal: ${signal.direction}\n` +
-          `Market: ${signal.market}\n` +
-          `Symbol: ${signal.symbol}\n` +
-          `Entry: ${signal.entry}\n` +
-          `Stop Loss: ${signal.stopLoss}\n` +
-          `Take Profit: ${signal.takeProfit}\n` +
-          `Risk/Reward: 1:2\n` +
-          `Strategy: ${signal.strategy}\n` +
-          `Signal only. No trade was placed.`
-        );
-      } catch (error) {
-        errors.push({
-          market: market.requested,
-          symbol: market.symbol,
-          error: error.message
-        });
+          if (signal) await recordSignal(signal, found);
+        } catch (error) {
+          errors.push({
+            market: market.requested,
+            symbol: market.symbol,
+            error: error.message
+          });
 
-        log(`Scan failed for ${market.requested}: ${error.message}`);
+          log(`Scan failed for ${market.requested}: ${error.message}`);
+
+          // Out of credits or rate limited: stop hitting the API
+          if (/credit|limit|quota/i.test(error.message)) break;
+        }
+
+        await sleep(1500);
       }
     }
 
     lastScanTime = new Date().toISOString();
 
     return {
-      scanned: resolvedMarkets.length,
+      scanned,
+      indicesScanned,
+      usMarketOpen: isUsMarketOpen(),
+      indexDataEnabled: Boolean(TWELVE_KEY),
       unavailableMarkets,
       newSignals: found.length,
       signals: found,
@@ -1036,6 +1218,9 @@ app.get('/api/status', (req, res) => {
     lastError,
     scanRunning,
     requestedMarkets: MARKETS,
+    indexMarkets: INDEX_MARKETS,
+    usMarketOpen: isUsMarketOpen(),
+    indexDataEnabled: Boolean(TWELVE_KEY),
     resolvedMarkets,
     unavailableMarkets,
     livePrices,
@@ -1075,7 +1260,7 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 setInterval(() => {
-  if (connected && !scanRunning) {
+  if (!scanRunning) {
     runScan().catch(error => {
       lastError = error.message;
       log(`Scheduled scan failed: ${error.message}`);
