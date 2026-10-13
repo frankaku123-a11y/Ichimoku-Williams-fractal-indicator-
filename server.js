@@ -660,44 +660,69 @@ function averageRange(candles, count = 14) {
   ) / recent.length;
 }
 
+
 function findBreakoutRetest(candles, level, direction) {
-  if (candles.length < 8) return false;
+  if (!Array.isArray(candles) || candles.length < 10) {
+    return false;
+  }
 
   const lastIndex = candles.length - 1;
   const latest = candles[lastIndex];
-  const tolerance = averageRange(candles, 14) * 0.20;
+  const average = averageRange(candles, 14);
 
-  let breakoutIndex = -1;
+  if (!latest || average <= 0) return false;
 
-  for (let i = Math.max(1, lastIndex - 6); i < lastIndex; i++) {
+  // Avoid treating a candle that barely crosses the level as a breakout.
+  const breakoutBuffer = average * 0.05;
+  const retestTolerance = average * 0.20;
+
+  // The breakout must happen on a recent CLOSED candle.
+  // The latest candle must be a later retest/rejection candle.
+  const firstIndex = Math.max(1, lastIndex - 4);
+
+  for (let i = firstIndex; i < lastIndex; i++) {
     const previous = candles[i - 1];
-    const current = candles[i];
+    const breakout = candles[i];
+
+    let validBreakout = false;
 
     if (direction === 'BUY') {
-      if (previous.close <= level && current.close > level) {
-        breakoutIndex = i;
+      validBreakout =
+        previous.close <= level &&
+        breakout.close > level + breakoutBuffer &&
+        breakout.close > breakout.open;
+    } else {
+      validBreakout =
+        previous.close >= level &&
+        breakout.close < level - breakoutBuffer &&
+        breakout.close < breakout.open;
+    }
+
+    if (!validBreakout) continue;
+
+    // Require a later candle to retest the broken level and reject it.
+    if (direction === 'BUY') {
+      const retested = latest.low <= level + retestTolerance;
+      const heldAbove = latest.close > level;
+      const bullishRejection = latest.close > latest.open;
+
+      if (retested && heldAbove && bullishRejection) {
+        return true;
       }
     } else {
-      if (previous.close >= level && current.close < level) {
-        breakoutIndex = i;
+      const retested = latest.high >= level - retestTolerance;
+      const heldBelow = latest.close < level;
+      const bearishRejection = latest.close < latest.open;
+
+      if (retested && heldBelow && bearishRejection) {
+        return true;
       }
     }
   }
 
-  if (breakoutIndex < 0 || breakoutIndex >= lastIndex) {
-    return false;
-  }
-
-  if (direction === 'BUY') {
-    return latest.low <= level + tolerance &&
-      latest.close > level &&
-      latest.close > latest.open;
-  }
-
-  return latest.high >= level - tolerance &&
-    latest.close < level &&
-    latest.close < latest.open;
+  return false;
 }
+
 
 function evaluateSignal(
   market,
