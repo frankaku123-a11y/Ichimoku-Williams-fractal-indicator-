@@ -724,6 +724,7 @@ function findBreakoutRetest(candles, level, direction) {
 }
 
 
+
 function evaluateSignal(
   market,
   candles12h,
@@ -731,6 +732,16 @@ function evaluateSignal(
   candles15m,
   candles5m
 ) {
+  if (
+    !candles12h || candles12h.length < 30 ||
+    !candles1h || candles1h.length < 30 ||
+    !candles15m || candles15m.length < 10 ||
+    !candles5m || candles5m.length < 3
+  ) {
+    return null;
+  }
+
+  // 1. Confirm 12H and 1H Ichimoku direction
   const direction12h = ichimokuDirection(candles12h);
   const direction1h = ichimokuDirection(candles1h);
 
@@ -743,6 +754,8 @@ function evaluateSignal(
   }
 
   const direction = direction12h;
+
+  // 2. Find confirmed 15M Williams fractals
   const fractals = findFractals(candles15m);
 
   if (!fractals.highs.length || !fractals.lows.length) {
@@ -752,21 +765,34 @@ function evaluateSignal(
   const lastHigh = fractals.highs[fractals.highs.length - 1];
   const lastLow = fractals.lows[fractals.lows.length - 1];
 
+  // 3. Use the latest completed candles
   const latest5 = candles5m[candles5m.length - 1];
   const previous5 = candles5m[candles5m.length - 2];
+  const latest15 = candles15m[candles15m.length - 1];
 
-  if (!latest5 || !previous5) return null;
+  if (!latest5 || !previous5 || !latest15) {
+    return null;
+  }
 
   let entry;
   let stopLoss;
   let takeProfit;
   let reason;
 
+  // 4. BUY setup
   if (direction === 'BUY') {
-    if (!findBreakoutRetest(candles15m, lastHigh.price, 'BUY')) {
+    // Require a 15M fractal breakout and retest
+    if (
+      !findBreakoutRetest(
+        candles15m,
+        lastHigh.price,
+        'BUY'
+      )
+    ) {
       return null;
     }
 
+    // Require bullish 5M confirmation
     if (
       latest5.close <= latest5.open ||
       latest5.close <= previous5.close
@@ -776,23 +802,42 @@ function evaluateSignal(
 
     entry = latest5.close;
 
+    // Stop below the recent swing low
     stopLoss = Math.min(
       lastLow.price,
-      candles15m[candles15m.length - 1].low
+      latest15.low
     );
 
-    if (stopLoss >= entry) return null;
-
-    takeProfit = entry + 2 * (entry - stopLoss);
-
-    reason =
-      (market.htfLabel || '12H') + '/1H Ichimoku bullish; 15M fractal breakout and retest; ' +
-      '5M bullish confirmation';
-  } else {
-    if (!findBreakoutRetest(candles15m, lastLow.price, 'SELL')) {
+    if (
+      !Number.isFinite(entry) ||
+      !Number.isFinite(stopLoss) ||
+      stopLoss >= entry
+    ) {
       return null;
     }
 
+    // 1:2 risk-reward
+    takeProfit = entry + 2 * (entry - stopLoss);
+
+    reason =
+      (market.htfLabel || '12H') +
+      '/1H Ichimoku bullish; 15M fractal breakout and retest; ' +
+      '5M bullish confirmation';
+
+  // 5. SELL setup
+  } else if (direction === 'SELL') {
+    // Require a 15M fractal breakout and retest
+    if (
+      !findBreakoutRetest(
+        candles15m,
+        lastLow.price,
+        'SELL'
+      )
+    ) {
+      return null;
+    }
+
+    // Require bearish 5M confirmation
     if (
       latest5.close >= latest5.open ||
       latest5.close >= previous5.close
@@ -802,20 +847,33 @@ function evaluateSignal(
 
     entry = latest5.close;
 
+    // Stop above the recent swing high
     stopLoss = Math.max(
       lastHigh.price,
-      candles15m[candles15m.length - 1].high
+      latest15.high
     );
 
-    if (stopLoss <= entry) return null;
+    if (
+      !Number.isFinite(entry) ||
+      !Number.isFinite(stopLoss) ||
+      stopLoss <= entry
+    ) {
+      return null;
+    }
 
+    // 1:2 risk-reward
     takeProfit = entry - 2 * (stopLoss - entry);
 
     reason =
-      (market.htfLabel || '12H') + '/1H Ichimoku bearish; 15M fractal breakout and retest; ' +
+      (market.htfLabel || '12H') +
+      '/1H Ichimoku bearish; 15M fractal breakout and retest; ' +
       '5M bearish confirmation';
+
+  } else {
+    return null;
   }
 
+  // 6. Format prices
   const digits = getDecimals(market.requested);
 
   return {
@@ -833,6 +891,7 @@ function evaluateSignal(
     status: 'SIGNAL ONLY'
   };
 }
+
 
 async function sendTelegram(message) {
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
